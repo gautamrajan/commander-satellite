@@ -1,0 +1,84 @@
+
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Dumpster Detection Review</title>
+    <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+    <div class="container">
+        <h1>Dumpster Detection Review</h1>
+        <div id="review-area">
+            <div id="image-container">
+                <img id="detection-image" src="" alt="Detection Image">
+            </div>
+            <div id="info-container">
+                <p><strong>Confidence:</strong> <span id="confidence"></span></p>
+                <p><strong>Path:</strong> <span id="path"></span></p>
+            </div>
+            <div id="button-container">
+                <button id="reject-btn">Reject</button>
+                <button id="approve-btn">Approve</button>
+            </div>
+        </div>
+        <div id="no-more-detections" style="display: none;">
+            <h2>No more detections to review.</h2>
+        </div>
+    </div>
+    <script>
+        document.addEventListener("DOMContentLoaded", () => {
+            const detectionImage = document.getElementById("detection-image");
+            const confidenceSpan = document.getElementById("confidence");
+            const pathSpan = document.getElementById("path");
+            const approveBtn = document.getElementById("approve-btn");
+            const rejectBtn = document.getElementById("reject-btn");
+            const reviewArea = document.getElementById("review-area");
+            const noMoreDetections = document.getElementById("no-more-detections");
+
+            let detections = [];
+            let currentIndex = 0;
+
+            function loadNextDetection() {
+                if (currentIndex < detections.length) {
+                    const detection = detections[currentIndex];
+                    detectionImage.src = `/image/${detection.path}`;
+                    confidenceSpan.textContent = detection.confidence;
+                    pathSpan.textContent = detection.path;
+                    reviewArea.style.display = "block";
+                    noMoreDetections.style.display = "none";
+                } else {
+                    reviewArea.style.display = "none";
+                    noMoreDetections.style.display = "block";
+                }
+            }
+
+            function review(approved) {
+                const detection = detections[currentIndex];
+                fetch("/review", {
+                    method: "POST",
+                    headers: {
+                        "Content-Type": "application/json",
+                    },
+                    body: JSON.stringify({ path: detection.path, approved }),
+                })
+                .then(() => {
+                    currentIndex++;
+                    loadNextDetection();
+                });
+            }
+
+            approveBtn.addEventListener("click", () => review(true));
+            rejectBtn.addEventListener("click", () => review(false));
+
+            fetch("/detections")
+                .then(response => response.json())
+                .then(data => {
+                    detections = data;
+                    loadNextDetection();
+                });
+        });
+    </script>
+</body>
+</html>

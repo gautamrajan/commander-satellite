@@ -1,0 +1,9 @@
+.DS_Store
+reviewed_results.jsonl
+marina_.05
+tiles/*
+mosaic.tif
+.env
+mosaic_preview.png
+all_results.jsonl
+dumpsters.jsonl
