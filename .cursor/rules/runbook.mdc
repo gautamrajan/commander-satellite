@@ -1,0 +1,31 @@
+---
+alwaysApply: false
+description: Quickstart commands to run end-to-end; handy for onboarding and CI notes
+---
+### End-to-End Runbook
+
+#### 1) Fetch imagery and save tiles
+
+```bash
+python grab_imagery.py --lat 37.7749 --lon -122.4194 --area_sqmi 1.0 \
+  --tiff sf.tiff --png sf_preview.png --save_tiles_dir tiles
+```
+
+#### 2) Scan tiles via OpenRouter
+
+```bash
+export OPENROUTER_API_KEY=...  # required
+python scan_dumpsters.py --tiles_dir tiles --out dumpsters.jsonl \
+  --log_all all_results.jsonl --rpm 60 --model google/gemini-2.5-pro
+```
+
+#### 3) Launch review UI
+
+```bash
+python review_app.py  # visit http://127.0.0.1:5000/
+```
+
+#### Notes
+
+- The review UI reads `all_results.jsonl` and hides anything already in `reviewed_results.jsonl`.
+- Keep large artifacts out of VCS: `tiles/`, `*.tiff`, `*.png`, `*.jsonl`.

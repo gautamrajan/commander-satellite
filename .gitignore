@@ -7,3 +7,5 @@ mosaic.tif
 mosaic_preview.png
 all_results.jsonl
 dumpsters.jsonl
+runs
+*.log

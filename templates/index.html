@@ -6,32 +6,433 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Dumpster Detection Review</title>
     <link rel="stylesheet" href="/static/style.css">
+    <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" integrity="sha256-p4NxAoJBhIIN+hmNHrzRCf9tD/miZyoHS5obTRR9BMY=" crossorigin=""/>
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css" crossorigin="anonymous"/>
+    <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js" integrity="sha256-20nQCchB9co0qIjJZRGuk2/Z9VM+kNiyxNV1lvTlZBo=" crossorigin=""></script>
 </head>
 <body>
     <div class="container">
-        <h1>Dumpster Detection Review</h1>
-        <div id="review-area">
-            <div id="image-container">
-                <img id="detection-image" src="" alt="Detection Image">
-            </div>
-            <div id="info-container">
-                <p><strong>Confidence:</strong> <span id="confidence"></span></p>
-                <p><strong>Path:</strong> <span id="path"></span></p>
-            </div>
-            <div id="button-container">
-                <button id="reject-btn">Reject</button>
-                <button id="approve-btn">Approve</button>
+        <h1 style="text-align:left;margin:0 0 10px;">Dumpster Detection Review</h1>
+
+        <div class="tabs">
+            <button class="tab-button active" data-tab="tab-areas">Areas</button>
+            <button class="tab-button" data-tab="tab-review">Review</button>
+            <button class="tab-button" data-tab="tab-mosaic">Mosaic</button>
+            <button class="tab-button" data-tab="tab-scan">Scan</button>
+        </div>
+
+        <div id="tab-areas" class="tab-content active">
+            <div class="areas-layout">
+                <div class="areas-left">
+                    <div id="map"></div>
+                    <div class="area-form">
+                        <div class="row"><label>Name</label><input id="area-name" type="text" placeholder="Area name"></div>
+                        <div class="row"><label>Center Lat</label><input id="area-lat" type="number" step="0.000001" placeholder="Click map"/></div>
+                        <div class="row"><label>Center Lon</label><input id="area-lon" type="number" step="0.000001" placeholder="Click map"/></div>
+                        <div class="row"><label>Area (sq mi)</label><input id="area-sqmi" type="number" step="0.01" value="0.25"/></div>
+                        <div class="row"><label>Zoom</label><input id="area-zoom" type="number" placeholder="auto"/></div>
+                        <div class="actions"><button id="area-create">Create Area</button></div>
+                    </div>
+                </div>
+                <div class="areas-right">
+                    <div class="areas-header">
+                        <h3>Areas</h3>
+                        <button id="areas-refresh">Refresh</button>
+                    </div>
+                    <div id="areas-list" class="areas-list"></div>
+                </div>
             </div>
         </div>
-        <div id="no-more-detections" style="display: none;">
-            <h2>No more detections to review.</h2>
+
+        <div id="tab-review" class="tab-content">
+            <div class="aoi-controls">
+                <label for="area-select-review">Area:</label>
+                <select id="area-select-review"><option value="">Global</option></select>
+            </div>
+            <div id="review-area">
+                <div id="image-container">
+                    <img id="detection-image" src="" alt="Detection Image">
+                </div>
+                <div id="info-container">
+                    <p><strong>Confidence:</strong> <span id="confidence"></span></p>
+                    <p><strong>Path:</strong> <span id="path"></span></p>
+                </div>
+                <div id="button-container">
+                    <button id="reject-btn">Reject</button>
+                    <button id="approve-btn">Approve</button>
+                </div>
+            </div>
+            <div id="no-more-detections" style="display: none;">
+                <h2>No more detections to review.</h2>
+            </div>
+        </div>
+
+        <div id="tab-mosaic" class="tab-content">
+            <div class="mosaic-controls">
+                <label for="area-select-mosaic">Area:</label>
+                <select id="area-select-mosaic"><option value="">Global</option></select>
+                <div class="spacer"></div>
+                <label for="zoom-select">Zoom:</label>
+                <select id="zoom-select"></select>
+                <div class="spacer"></div>
+                <label for="mosaic-filter">Filter:</label>
+                <select id="mosaic-filter">
+                    <option value="all">All</option>
+                    <option value="ai_pos">AI Positive</option>
+                    <option value="ai_neg">AI Negative</option>
+                    <option value="rev_app">Reviewed Approved</option>
+                    <option value="rev_rej">Reviewed Rejected</option>
+                </select>
+                <div class="spacer"></div>
+                <label for="tile-size-range">Tile size</label>
+                <input id="tile-size-range" type="range" min="64" max="256" step="16" value="96">
+                <button id="open-fullscreen">Fullscreen</button>
+            </div>
+            <div class="mosaic-layout">
+                <div id="mosaic-container">
+                    <div id="mosaic-grid"></div>
+                </div>
+                <aside id="mosaic-sidebar">
+                    <h3>Area summary</h3>
+                    <div id="mosaic-area-summary" style="font-size:13px; line-height:1.5;">Select an area/zoom to see stats.</div>
+                    <div style="margin:10px 0;">
+                        <button id="mosaic-refresh">Refresh tiles</button>
+                    </div>
+                    <h3>Selected tile</h3>
+                    <div id="tile-detail" class="tile-detail">
+                        <div id="tile-detail-image-wrap"><img id="tile-detail-image" alt="Selected tile" /></div>
+                        <div id="tile-detail-meta">
+                            <div><strong>Path:</strong> <span id="tile-detail-path">-</span></div>
+                            <div><strong>AI:</strong> <span id="tile-detail-ai">-</span></div>
+                            <div><strong>Confidence:</strong> <span id="tile-detail-conf">-</span></div>
+                            <div><strong>Reviewed:</strong> <span id="tile-detail-review">-</span></div>
+                        </div>
+                        <div class="tile-detail-actions">
+                            <button id="tile-approve">Approve</button>
+                            <button id="tile-reject">Reject</button>
+                        </div>
+                    </div>
+                    <h3>Legend</h3>
+                    <div class="legend">
+                        <div class="item"><span class="swatch positive"></span><span>AI Positive (unreviewed)</span></div>
+                        <div class="item"><span class="swatch negative"></span><span>AI Negative (unreviewed)</span></div>
+                        <div class="item"><span class="swatch unknown"></span><span>No AI metadata</span></div>
+                        <div class="item"><span class="swatch rev-app"></span><span>Reviewed Approved</span></div>
+                        <div class="item"><span class="swatch rev-rej"></span><span>Reviewed Rejected</span></div>
+                    </div>
+                </aside>
+            </div>
+        </div>
+
+        <div id="mosaic-fullscreen" class="fullscreen-overlay" role="dialog" aria-modal="true">
+            <div class="fullscreen-inner">
+                <div class="fullscreen-toolbar">
+                    <div>
+                        <label for="zoom-select-full" style="color:#fff;">Zoom:</label>
+                        <select id="zoom-select-full"></select>
+                        <label for="tile-size-range-full" style="color:#fff; margin-left:8px;">Tile size</label>
+                        <input id="tile-size-range-full" type="range" min="64" max="256" step="16" value="128">
+                    </div>
+                    <div>
+                        <button id="close-fullscreen">Close</button>
+                    </div>
+                </div>
+                <div class="fullscreen-grid">
+                    <div id="mosaic-grid-full" style="display:grid; grid-auto-rows: var(--tile-size);"></div>
+                </div>
+            </div>
+        </div>
+
+        <div id="tab-scan" class="tab-content">
+            <div class="scan-form">
+                <div class="row">
+                    <label>Area</label>
+                    <select id="scan-area-select">
+                        <option value="">Global (tiles/)</option>
+                    </select>
+                </div>
+                <div class="row">
+                    <label>Tiles dir</label>
+                    <input id="scan-tiles-dir" type="text" placeholder="tiles" value="tiles">
+                </div>
+                <div class="row">
+                    <label>Model</label>
+                    <input id="scan-model" type="text" value="google/gemini-2.5-pro">
+                </div>
+                <div class="row">
+                    <label>RPM</label>
+                    <input id="scan-rpm" type="number" value="60">
+                </div>
+                <div class="row">
+                    <label>Min confidence</label>
+                    <input id="scan-min-conf" type="number" step="0.01" value="0.5">
+                </div>
+                <div class="row">
+                    <label>Context radius</label>
+                    <input id="scan-context" type="number" value="1">
+                </div>
+                <div class="row">
+                    <label>Coarse factor</label>
+                    <input id="scan-coarse-factor" type="number" value="2">
+                </div>
+                <div class="row">
+                    <label>Coarse downscale</label>
+                    <input id="scan-coarse-down" type="number" value="256">
+                </div>
+                <div class="row">
+                    <label>Coarse threshold</label>
+                    <input id="scan-coarse-thresh" type="number" step="0.01" value="0.3">
+                </div>
+                <div class="row">
+                    <label>Limit</label>
+                    <input id="scan-limit" type="number" placeholder="optional">
+                </div>
+                <div class="scan-estimate">
+                    <div><strong>Estimated API Requests:</strong> <span id="scan-request-estimate">-</span></div>
+                </div>
+                <div class="actions">
+                    <button id="scan-start">Start Scan</button>
+                    <button id="scan-stop" disabled>Stop Scan</button>
+                </div>
+            </div>
+            <div class="scan-status">
+                <div>Running: <span id="scan-running">-</span></div>
+                <div>PID: <span id="scan-pid">-</span></div>
+                <div class="scan-progress">
+                    <div><strong>Progress</strong> <span id="scan-progress-text">-</span></div>
+                    <div class="progress scan">
+                        <div class="bar" id="scan-progress-bar"></div>
+                    </div>
+                </div>
+                <div>All results new lines: <span id="scan-count-all">0</span></div>
+                <div>Positives new lines: <span id="scan-count-out">0</span></div>
+                <div>Coarse new lines: <span id="scan-count-coarse">0</span></div>
+            </div>
+            <div class="scan-logs">
+                <pre id="scan-stdout"></pre>
+                <pre id="scan-stderr"></pre>
+            </div>
         </div>
     </div>
     <script>
         document.addEventListener("DOMContentLoaded", () => {
+            // Tabs
+            const tabButtons = document.querySelectorAll('.tab-button');
+            const tabContents = document.querySelectorAll('.tab-content');
+            tabButtons.forEach(btn => {
+                btn.addEventListener('click', () => {
+                    tabButtons.forEach(b => b.classList.remove('active'));
+                    tabContents.forEach(c => c.classList.remove('active'));
+                    btn.classList.add('active');
+                    const target = document.getElementById(btn.dataset.tab);
+                    if (target) target.classList.add('active');
+                });
+            });
+
             const detectionImage = document.getElementById("detection-image");
             const confidenceSpan = document.getElementById("confidence");
             const pathSpan = document.getElementById("path");
+            // Areas tab setup
+            const areasListEl = document.getElementById('areas-list');
+            const areasRefreshBtn = document.getElementById('areas-refresh');
+            const areaSelectReview = document.getElementById('area-select-review');
+            const areaSelectMosaic = document.getElementById('area-select-mosaic');
+            const scanAreaSelect = document.getElementById('scan-area-select');
+            const areaNameInput = document.getElementById('area-name');
+            const areaLatInput = document.getElementById('area-lat');
+            const areaLonInput = document.getElementById('area-lon');
+            const areaSqmiInput = document.getElementById('area-sqmi');
+            const areaZoomInput = document.getElementById('area-zoom');
+            const areaCreateBtn = document.getElementById('area-create');
+
+            // Leaflet map
+            const map = L.map('map').setView([37.7749, -122.4194], 12);
+            L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+                maxZoom: 19,
+                attribution: '&copy; OpenStreetMap contributors'
+            }).addTo(map);
+            map.on('click', (e) => {
+                areaLatInput.value = e.latlng.lat.toFixed(6);
+                areaLonInput.value = e.latlng.lng.toFixed(6);
+            });
+
+            function refreshAreas() {
+                // Clear existing intervals
+                areasListEl.querySelectorAll('[data-interval-id]').forEach(row => {
+                    const intervalId = parseInt(row.dataset.intervalId);
+                    if (intervalId) clearInterval(intervalId);
+                });
+                
+                fetch('/areas').then(r => r.json()).then(list => {
+                    // list is an array of {id, name, center, ...}
+                    areasListEl.innerHTML = '';
+                    // repopulate selects
+                    function fillSelect(sel) {
+                        const current = sel.value;
+                        sel.innerHTML = '<option value="">Global</option>';
+                        for (const a of list) {
+                            const opt = document.createElement('option');
+                            opt.value = a.id; opt.textContent = a.name || a.id;
+                            sel.appendChild(opt);
+                        }
+                        sel.value = current && [...sel.options].some(o => o.value === current) ? current : '';
+                    }
+                    fillSelect(areaSelectReview);
+                    fillSelect(areaSelectMosaic);
+                    fillSelect(scanAreaSelect);
+
+                    for (const a of list) {
+                        const row = document.createElement('div');
+                        row.className = 'area-row';
+                        row.innerHTML = `
+                            <div class="area-meta">
+                                <div class="area-header">
+                                  <div class="area-name">${a.name || a.id}</div>
+                                  <div class="area-icons">
+                                    <button class="icon-btn" data-action="rename" data-id="${a.id}" title="Rename"><i class="fas fa-pencil-alt"></i></button>
+                                    <button class="icon-btn danger" data-action="delete" data-id="${a.id}" title="Delete"><i class="fas fa-trash"></i></button>
+                                  </div>
+                                </div>
+                                <div class="area-sub">${(a.center && (a.center.lat + ', ' + a.center.lon)) || ''}</div>
+                                <div class="area-metrics">
+                                  <div><strong>Fetch</strong> <span data-role="fetch-text">-</span></div>
+                                  <div class="progress fetch"><div class="bar" data-role="fetch-bar"></div></div>
+                                  <div><strong>Scan</strong> <span data-role="scan-text">-</span></div>
+                                  <div class="progress scan"><div class="bar" data-role="scan-bar"></div></div>
+                                </div>
+                                <div class="area-status">
+                                    <span class="badge badge-idle" data-role="fetch-status">fetch: -</span>
+                                    <span class="badge badge-idle" data-role="scan-status">scan: -</span>
+                                </div>
+                                <div class="area-actions">
+                                    <button data-action="fetch" data-id="${a.id}">Fetch</button>
+                                    <button data-action="scan" data-id="${a.id}">Scan</button>
+                                    <button data-action="review" data-id="${a.id}">Review</button>
+                                    <button data-action="mosaic" data-id="${a.id}">Mosaic</button>
+                                </div>
+                            </div>`;
+                        areasListEl.appendChild(row);
+
+                        const fetchBadge = row.querySelector('[data-role="fetch-status"]');
+                        const scanBadge = row.querySelector('[data-role="scan-status"]');
+                        const fetchBar = row.querySelector('[data-role="fetch-bar"]');
+                        const scanBar = row.querySelector('[data-role="scan-bar"]');
+                        const fetchText = row.querySelector('[data-role="fetch-text"]');
+                        const scanText = row.querySelector('[data-role="scan-text"]');
+                        const id = a.id;
+                        function setBadge(badge, running, label) {
+                            badge.textContent = label;
+                            badge.classList.remove('badge-idle','badge-running','badge-done');
+                            badge.classList.add(running ? 'badge-running' : 'badge-done');
+                        }
+                        // polling function for this area
+                        function pollAreaProgress() {
+                            fetch(`/areas/${id}/fetch/status`).then(r=>r.json()).then(s=>{
+                                setBadge(fetchBadge, !!s.running, `fetch: ${s.running ? 'running' : (s.zooms?.length ? 'done' : 'ok')}`);
+                                const p = s.progress || {};
+                                const pct = (typeof p.percent === 'number') ? p.percent : null;
+                                if (pct !== null && fetchBar) {
+                                    fetchBar.style.width = pct + '%';
+                                    if (fetchText) fetchText.textContent = `${p.fetched ?? 0}/${p.target ?? '?' } (${pct}%)`;
+                                } else {
+                                    // No target available, show just a counter
+                                    if (fetchBar) fetchBar.style.width = '0%';
+                                    if (fetchText) fetchText.textContent = `${p.fetched ?? 0} tiles`;
+                                }
+                            }).catch(()=>{});
+                            fetch(`/areas/${id}/scan/status`).then(r=>r.json()).then(s=>{
+                                setBadge(scanBadge, !!s.running, `scan: ${s.running ? 'running' : 'ok'}`);
+                                const p = s.progress || {};
+                                const pct = (typeof p.percent === 'number') ? p.percent : null;
+                                if (pct !== null && scanBar) {
+                                    scanBar.style.width = pct + '%';
+                                    if (scanText) scanText.textContent = `${p.processed ?? 0}/${p.total ?? '?' } (${pct}%)`;
+                                } else {
+                                    if (scanBar) scanBar.style.width = '0%';
+                                    if (scanText) scanText.textContent = `${p.processed ?? 0} processed`;
+                                }
+                            }).catch(()=>{});
+                        }
+                        
+                        // initial poll
+                        pollAreaProgress();
+                        
+                        // set up auto-refresh every 2 seconds
+                        const intervalId = setInterval(pollAreaProgress, 2000);
+                        
+                        // store interval ID so we can clean up later if needed
+                        row.dataset.intervalId = intervalId;
+                    }
+
+                    areasListEl.querySelectorAll('button[data-action]').forEach(btn => {
+                        btn.addEventListener('click', () => {
+                            const id = btn.getAttribute('data-id');
+                            const action = btn.getAttribute('data-action');
+                            if (action === 'fetch') {
+                                fetch(`/areas/${id}/fetch/start`, {method: 'POST'}).then(() => {});
+                            } else if (action === 'scan') {
+                                fetch(`/areas/${id}/scan/start`, {method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify({})}).then(() => {});
+                            } else if (action === 'review') {
+                                areaSelectReview.value = id; tabButtons[1].click(); // Review tab
+                                loadDetectionsForArea();
+                            } else if (action === 'mosaic') {
+                                areaSelectMosaic.value = id; tabButtons[2].click(); // Mosaic tab
+                                loadMosaicZoomsForArea();
+                            } else if (action === 'rename') {
+                                const newName = prompt('New area name:');
+                                if (newName && newName.trim()) {
+                                    fetch(`/areas/${id}`, {method:'PATCH', headers:{'Content-Type':'application/json'}, body: JSON.stringify({name:newName.trim()})})
+                                      .then(()=> refreshAreas());
+                                }
+                            } else if (action === 'delete') {
+                                if (confirm('Delete this area and all its files?')) {
+                                    fetch(`/areas/${id}`, {method:'DELETE'}).then(()=> refreshAreas());
+                                }
+                            }
+                        });
+                    });
+                }).catch(() => {});
+            }
+
+            areasRefreshBtn.addEventListener('click', refreshAreas);
+            areaCreateBtn.addEventListener('click', () => {
+                const name = areaNameInput.value.trim() || undefined;
+                const lat = Number(areaLatInput.value);
+                const lon = Number(areaLonInput.value);
+                const area_sqmi = Number(areaSqmiInput.value || 0.25);
+                const zoomVal = areaZoomInput.value.trim();
+                const payload = { name, center: { lat, lon }, area_sqmi };
+                if (zoomVal) payload.zoom = Number(zoomVal);
+                fetch('/areas', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload) })
+                    .then(r => r.json()).then(() => refreshAreas());
+            });
+
+            function loadDetectionsForArea() {
+                const areaId = areaSelectReview.value;
+                const url = areaId ? `/areas/${areaId}/detections` : '/detections';
+                fetch(url)
+                    .then(response => response.json())
+                    .then(data => { detections = data; currentIndex = 0; loadNextDetection(); });
+            }
+
+            function loadMosaicZoomsForArea() {
+                const areaId = areaSelectMosaic.value;
+                const url = areaId ? `/areas/${areaId}/mosaic/zooms` : '/mosaic/zooms';
+                fetch(url).then(r => r.json()).then(zooms => {
+                    const select = document.getElementById('zoom-select');
+                    syncZoomOptions(select, zooms);
+                    if (zooms && zooms.length) {
+                        const initial = zooms[zooms.length - 1];
+                        select.value = String(initial);
+                        const gridEl = document.getElementById('mosaic-grid');
+                        const tilesUrl = areaId ? `/areas/${areaId}/mosaic/tiles/${initial}` : `/mosaic/tiles/${initial}`;
+                        fetch(tilesUrl).then(r => r.json()).then(data => renderMosaicTo(gridEl, data));
+                    }
+                });
+            }
+
+            // initialize areas
+            refreshAreas();
             const approveBtn = document.getElementById("approve-btn");
             const rejectBtn = document.getElementById("reject-btn");
             const reviewArea = document.getElementById("review-area");
@@ -43,7 +444,9 @@
             function loadNextDetection() {
                 if (currentIndex < detections.length) {
                     const detection = detections[currentIndex];
-                    detectionImage.src = `/image/${detection.path}`;
+                    const areaId = areaSelectReview.value;
+                    const imgUrl = areaId ? `/areas/${areaId}/image/${detection.path}` : `/image/${detection.path}`;
+                    detectionImage.src = imgUrl;
                     confidenceSpan.textContent = detection.confidence;
                     pathSpan.textContent = detection.path;
                     reviewArea.style.display = "block";
@@ -56,7 +459,9 @@
 
             function review(approved) {
                 const detection = detections[currentIndex];
-                fetch("/review", {
+                const areaId = areaSelectReview.value;
+                const url = areaId ? `/areas/${areaId}/review` : '/review';
+                fetch(url, {
                     method: "POST",
                     headers: {
                         "Content-Type": "application/json",
@@ -71,6 +476,8 @@
 
             approveBtn.addEventListener("click", () => review(true));
             rejectBtn.addEventListener("click", () => review(false));
+            areaSelectReview.addEventListener('change', loadDetectionsForArea);
+            areaSelectMosaic.addEventListener('change', loadMosaicZoomsForArea);
 
             fetch("/detections")
                 .then(response => response.json())
@@ -78,6 +485,433 @@
                     detections = data;
                     loadNextDetection();
                 });
+
+            // Mosaic logic
+            const zoomSelect = document.getElementById('zoom-select');
+            const mosaicFilter = document.getElementById('mosaic-filter');
+            const mosaicGrid = document.getElementById('mosaic-grid');
+
+            function fmtConfidence(c) {
+                if (c === null || c === undefined || isNaN(c)) return 'N/A';
+                return (Math.round(c * 1000) / 10) + '%';
+            }
+
+            function applyGridStyles(gridEl, cols) {
+                gridEl.style.gridTemplateColumns = `repeat(${cols}, var(--tile-size))`;
+                gridEl.style.gridAutoRows = 'var(--tile-size)';
+            }
+
+            function renderMosaicTo(gridEl, data) {
+                // data: { z, minX, maxX, minY, maxY, tiles: [...] }
+                gridEl.innerHTML = '';
+                // Update sidebar summary counters
+                const summaryEl = document.getElementById('mosaic-area-summary');
+                let cntTotal = 0, cntMeta = 0, cntAIP = 0, cntAIN = 0, cntRevApp = 0, cntRevRej = 0;
+                if (Array.isArray(data.tiles)) {
+                    for (const t of data.tiles) {
+                        cntTotal++;
+                        const hasMeta = t.confidence !== null && t.confidence !== undefined;
+                        if (hasMeta) cntMeta++;
+                        if (t.reviewed) {
+                            if (t.approved) cntRevApp++; else cntRevRej++;
+                        } else if (hasMeta) {
+                            if (t.positive) cntAIP++; else cntAIN++;
+                        }
+                    }
+                }
+                if (summaryEl) {
+                    summaryEl.textContent = `Tiles: ${cntTotal} | AI meta: ${cntMeta} | AI+: ${cntAIP} | AI-: ${cntAIN} | Approved: ${cntRevApp} | Rejected: ${cntRevRej}`;
+                }
+                if (data.minX === null || data.maxX === null || data.minY === null || data.maxY === null) {
+                    gridEl.style.gridTemplateColumns = '1fr';
+                    const empty = document.createElement('div');
+                    empty.textContent = 'No tiles found for this zoom.';
+                    empty.style.padding = '16px';
+                    gridEl.appendChild(empty);
+                    return;
+                }
+                const cols = data.maxX - data.minX + 1;
+                const rows = data.maxY - data.minY + 1;
+                applyGridStyles(gridEl, cols);
+
+                for (const t of data.tiles) {
+                    // Apply status filter
+                    const filterVal = mosaicFilter ? mosaicFilter.value : 'all';
+                    const isReviewed = !!t.reviewed;
+                    const isApproved = t.approved === true;
+                    const hasMeta = t.confidence !== null && t.confidence !== undefined;
+                    const isAIPos = hasMeta && !!t.positive;
+                    const isAINeg = hasMeta && !t.positive;
+                    let pass = true;
+                    switch (filterVal) {
+                        case 'ai_pos': pass = !isReviewed && isAIPos; break;
+                        case 'ai_neg': pass = !isReviewed && isAINeg; break;
+                        case 'rev_app': pass = isReviewed && isApproved; break;
+                        case 'rev_rej': pass = isReviewed && !isApproved; break;
+                        default: pass = true;
+                    }
+                    if (!pass) continue;
+                    const col = (t.x - data.minX) + 1;
+                    const row = (t.y - data.minY) + 1;
+                    const tile = document.createElement('div');
+                    tile.className = 'mosaic-tile';
+                    
+                    // Determine display status based on review status or prediction
+                    let statusClass, statusText, displayConfidence;
+                    if (t.reviewed) {
+                        statusClass = t.approved ? 'reviewed-approved' : 'reviewed-rejected';
+                        statusText = t.approved ? 'Approved' : 'Rejected';
+                        displayConfidence = fmtConfidence(t.confidence);
+                    } else {
+                        const hasMeta = t.confidence !== null && t.confidence !== undefined;
+                        statusClass = !hasMeta ? 'unknown' : (t.positive ? 'positive' : 'negative');
+                        statusText = !hasMeta ? 'Unknown' : (t.positive ? 'AI Positive' : 'AI Negative');
+                        displayConfidence = fmtConfidence(t.confidence);
+                    }
+                    
+                    tile.classList.add(statusClass);
+                    tile.style.gridColumn = String(col);
+                    tile.style.gridRow = String(row);
+                    tile.style.backgroundImage = `url(${t.image_url})`;
+                    
+                    // Enhanced tooltip
+                    const reviewStatus = t.reviewed ? `\nReviewed: ${t.approved ? 'Approved' : 'Rejected'}` : '\nReviewed: No';
+                    tile.title = `Path: ${t.path}\nAI Prediction: ${t.positive ? 'Positive' : 'Negative'}\nConfidence: ${displayConfidence}${reviewStatus}\n\nClick to toggle review status`;
+
+                    const overlay = document.createElement('div');
+                    overlay.className = 'mosaic-overlay';
+                    overlay.innerHTML = `<div><strong>${statusText}</strong></div><div>${displayConfidence}</div>`;
+                    tile.appendChild(overlay);
+
+                    // Click: show tile details in sidebar
+                    tile.addEventListener('click', () => showTileDetail(tile, t));
+
+                    gridEl.appendChild(tile);
+                }
+            }
+
+            function renderMosaic(data) {
+                renderMosaicTo(mosaicGrid, data);
+            }
+
+            // Tile detail logic
+            const tileImg = document.getElementById('tile-detail-image');
+            const tilePathEl = document.getElementById('tile-detail-path');
+            const tileAIEl = document.getElementById('tile-detail-ai');
+            const tileConfEl = document.getElementById('tile-detail-conf');
+            const tileRevEl = document.getElementById('tile-detail-review');
+            const tileApproveBtn = document.getElementById('tile-approve');
+            const tileRejectBtn = document.getElementById('tile-reject');
+            let currentTileData = null;
+
+            function showTileDetail(tileEl, t) {
+                currentTileData = t;
+                const areaId = areaSelectMosaic.value;
+                const imgUrl = areaId ? `/areas/${areaId}/image/${t.path}` : `/image/${t.path}`;
+                if (tileImg) tileImg.src = imgUrl;
+                if (tilePathEl) tilePathEl.textContent = t.path;
+                if (tileAIEl) tileAIEl.textContent = (t.confidence === null || t.confidence === undefined) ? 'N/A' : (t.positive ? 'Positive' : 'Negative');
+                if (tileConfEl) tileConfEl.textContent = fmtConfidence(t.confidence);
+                if (tileRevEl) tileRevEl.textContent = t.reviewed ? (t.approved ? 'Approved' : 'Rejected') : 'No';
+            }
+
+            function postReviewForTile(approved) {
+                if (!currentTileData) return;
+                const areaId = areaSelectMosaic.value;
+                const url = areaId ? `/areas/${areaId}/review` : '/review';
+                fetch(url, { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify({ path: currentTileData.path, approved }) })
+                    .then(()=>{
+                        // Update local state and sidebar display
+                        currentTileData.reviewed = true;
+                        currentTileData.approved = !!approved;
+                        showTileDetail(null, currentTileData);
+                        // Also refresh the grid styling minimally
+                        const z = parseInt(zoomSelect.value, 10);
+                        if (!isNaN(z)) loadZoom(z);
+                    });
+            }
+            if (tileApproveBtn) tileApproveBtn.addEventListener('click', () => postReviewForTile(true));
+            if (tileRejectBtn) tileRejectBtn.addEventListener('click', () => postReviewForTile(false));
+            const mosaicRefreshBtn = document.getElementById('mosaic-refresh');
+            if (mosaicRefreshBtn) {
+                mosaicRefreshBtn.addEventListener('click', () => {
+                    const z = parseInt(zoomSelect.value, 10);
+                    if (!isNaN(z)) loadZoom(z);
+                });
+            }
+
+            // Function to toggle review status when tile is clicked
+            function toggleTileReview(tilePath, tileElement, tileData, areaId) {
+                const url = areaId ? `/areas/${areaId}/review/toggle` : '/review/toggle';
+                fetch(url, {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json',
+                    },
+                    body: JSON.stringify({ path: tilePath })
+                })
+                .then(response => response.json())
+                .then(result => {
+                    if (result.status === 'ok') {
+                        // Update tile appearance based on new status
+                        updateTileAppearance(tileElement, tileData, result.approved, true);
+                        
+                        // Update the tile data object for future reference
+                        tileData.reviewed = true;
+                        tileData.approved = result.approved;
+                        
+                        console.log(`Tile ${tilePath} ${result.approved ? 'approved' : 'rejected'}`);
+                    } else {
+                        console.error('Error toggling review status:', result);
+                    }
+                })
+                .catch(error => {
+                    console.error('Error toggling review status:', error);
+                });
+            }
+
+            // Helper function to update tile appearance
+            function updateTileAppearance(tileElement, tileData, approved, reviewed) {
+                // Remove old status classes
+                tileElement.classList.remove('positive', 'negative', 'unknown', 'reviewed-approved', 'reviewed-rejected');
+                
+                // Add new status class
+                if (reviewed) {
+                    tileElement.classList.add(approved ? 'reviewed-approved' : 'reviewed-rejected');
+                    
+                    // Update overlay text
+                    const overlay = tileElement.querySelector('.mosaic-overlay');
+                    if (overlay) {
+                        const statusText = approved ? 'Approved' : 'Rejected';
+                        const displayConfidence = fmtConfidence(tileData.confidence);
+                        overlay.innerHTML = `<div><strong>${statusText}</strong></div><div>${displayConfidence}</div>`;
+                    }
+                    
+                    // Update tooltip
+                    const reviewStatus = `\nReviewed: ${approved ? 'Approved' : 'Rejected'}`;
+                    tileElement.title = `Path: ${tileData.path}\nAI Prediction: ${tileData.positive ? 'Positive' : 'Negative'}\nConfidence: ${fmtConfidence(tileData.confidence)}${reviewStatus}\n\nClick to toggle review status`;
+                }
+            }
+
+            function loadZoom(z) {
+                const areaId = areaSelectMosaic.value;
+                const url = areaId ? `/areas/${areaId}/mosaic/tiles/${z}` : `/mosaic/tiles/${z}`;
+                fetch(url)
+                    .then(r => r.json())
+                    .then(renderMosaic);
+            }
+
+            function syncZoomOptions(selectEl, zooms) {
+                selectEl.innerHTML = '';
+                for (const z of zooms) {
+                    const opt = document.createElement('option');
+                    opt.value = z; opt.textContent = z; selectEl.appendChild(opt);
+                }
+            }
+
+            function loadZoomInto(selectEl, gridEl, z) {
+                const areaId = areaSelectMosaic.value;
+                const url = areaId ? `/areas/${areaId}/mosaic/tiles/${z}` : `/mosaic/tiles/${z}`;
+                fetch(url).then(r => r.json()).then(data => {
+                    renderMosaicTo(gridEl, data);
+                });
+            }
+
+            // Default load (global) for mosaic
+            fetch('/mosaic/zooms')
+                .then(r => r.json())
+                .then(zooms => {
+                    if (!zooms || !zooms.length) {
+                        const opt = document.createElement('option');
+                        opt.value = '';
+                        opt.textContent = 'No tiles';
+                        zoomSelect.appendChild(opt);
+                        const opt2 = opt.cloneNode(true);
+                        document.getElementById('zoom-select-full').appendChild(opt2);
+                        return;
+                    }
+                    syncZoomOptions(zoomSelect, zooms);
+                    syncZoomOptions(document.getElementById('zoom-select-full'), zooms);
+                    const initial = zooms[zooms.length - 1];
+                    zoomSelect.value = String(initial);
+                    loadZoom(initial);
+                    document.getElementById('zoom-select-full').value = String(initial);
+                    loadZoomInto(document.getElementById('zoom-select-full'), document.getElementById('mosaic-grid-full'), initial);
+                });
+
+            zoomSelect.addEventListener('change', () => {
+                const z = parseInt(zoomSelect.value, 10);
+                if (!isNaN(z)) loadZoom(z);
+            });
+            if (mosaicFilter) {
+                mosaicFilter.addEventListener('change', () => {
+                    const z = parseInt(zoomSelect.value, 10);
+                    if (!isNaN(z)) loadZoom(z);
+                });
+            }
+
+            // Tile size slider (inline)
+            const sizeRange = document.getElementById('tile-size-range');
+            sizeRange.addEventListener('input', () => {
+                document.documentElement.style.setProperty('--tile-size', `${sizeRange.value}px`);
+            });
+
+            // Fullscreen overlay controls
+            const openFullBtn = document.getElementById('open-fullscreen');
+            const closeFullBtn = document.getElementById('close-fullscreen');
+            const fullOverlay = document.getElementById('mosaic-fullscreen');
+            const zoomSelectFull = document.getElementById('zoom-select-full');
+            const gridFull = document.getElementById('mosaic-grid-full');
+            const sizeRangeFull = document.getElementById('tile-size-range-full');
+
+            openFullBtn.addEventListener('click', () => {
+                fullOverlay.classList.add('active');
+                document.querySelector('.container').classList.add('wide');
+            });
+            closeFullBtn.addEventListener('click', () => {
+                fullOverlay.classList.remove('active');
+                document.querySelector('.container').classList.remove('wide');
+            });
+            zoomSelectFull.addEventListener('change', () => {
+                const z = parseInt(zoomSelectFull.value, 10);
+                if (!isNaN(z)) loadZoomInto(zoomSelectFull, gridFull, z);
+            });
+            sizeRangeFull.addEventListener('input', () => {
+                document.documentElement.style.setProperty('--tile-size', `${sizeRangeFull.value}px`);
+                // recompute columns for current grid if needed
+            });
+
+            // Scan tab logic
+            const btnStart = document.getElementById('scan-start');
+            const btnStop = document.getElementById('scan-stop');
+            const requestEstimate = document.getElementById('scan-request-estimate');
+            const tilesDirInput = document.getElementById('scan-tiles-dir');
+            const modelInput = document.getElementById('scan-model');
+            const rpmInput = document.getElementById('scan-rpm');
+            const minConfInput = document.getElementById('scan-min-conf');
+            const ctxInput = document.getElementById('scan-context');
+            const coarseFactorInput = document.getElementById('scan-coarse-factor');
+            const coarseDownInput = document.getElementById('scan-coarse-down');
+            const coarseThreshInput = document.getElementById('scan-coarse-thresh');
+            const limitInput = document.getElementById('scan-limit');
+            const runningSpan = document.getElementById('scan-running');
+            const pidSpan = document.getElementById('scan-pid');
+            const countAll = document.getElementById('scan-count-all');
+            const countOut = document.getElementById('scan-count-out');
+            const countCoarse = document.getElementById('scan-count-coarse');
+            const stdoutPre = document.getElementById('scan-stdout');
+            const stderrPre = document.getElementById('scan-stderr');
+
+            // Update tiles directory when area is selected
+            scanAreaSelect.addEventListener('change', () => {
+                const selectedAreaId = scanAreaSelect.value;
+                if (selectedAreaId) {
+                    tilesDirInput.value = `runs/${selectedAreaId}/tiles`;
+                } else {
+                    tilesDirInput.value = 'tiles';
+                }
+                updateRequestEstimate();
+            });
+
+            // Function to update request estimate
+            function updateRequestEstimate() {
+                const payload = {
+                    tiles_dir: tilesDirInput.value || 'tiles',
+                    coarse_factor: Number(coarseFactorInput.value || 0),
+                    limit: limitInput.value ? Number(limitInput.value) : null,
+                };
+                fetch('/scan/estimate', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify(payload),
+                }).then(r => r.json()).then(est => {
+                    if (est.error) {
+                        requestEstimate.textContent = 'N/A (no tiles found)';
+                    } else {
+                        if (est.min_requests === est.max_requests) {
+                            requestEstimate.textContent = `${est.min_requests} requests`;
+                        } else {
+                            requestEstimate.textContent = `${est.min_requests}-${est.max_requests} requests`;
+                        }
+                    }
+                }).catch(() => {
+                    requestEstimate.textContent = 'Error calculating';
+                });
+            }
+
+            // Update estimate when relevant inputs change
+            [tilesDirInput, coarseFactorInput, limitInput].forEach(input => {
+                input.addEventListener('input', updateRequestEstimate);
+            });
+
+            // Initial estimate
+            updateRequestEstimate();
+
+            function pollStatus() {
+                fetch('/scan/status').then(r => r.json()).then(s => {
+                    const isRunning = s.running;
+                    runningSpan.textContent = isRunning ? 'yes' : 'no';
+                    pidSpan.textContent = s.pid || '-';
+                    countAll.textContent = s.counts?.all_results ?? 0;
+                    countOut.textContent = s.counts?.out ?? 0;
+                    countCoarse.textContent = s.counts?.coarse ?? 0;
+                    
+                    // Update button states
+                    btnStart.disabled = isRunning;
+                    btnStop.disabled = !isRunning;
+                    
+                    // Update progress bar
+                    const progressBar = document.getElementById('scan-progress-bar');
+                    const progressText = document.getElementById('scan-progress-text');
+                    const p = s.progress || {};
+                    const pct = (typeof p.percent === 'number') ? p.percent : null;
+                    
+                    if (pct !== null && progressBar) {
+                        progressBar.style.width = pct + '%';
+                        if (progressText) progressText.textContent = `${p.processed ?? 0}/${p.total ?? '?'} (${pct}%)`;
+                    } else {
+                        if (progressBar) progressBar.style.width = '0%';
+                        if (progressText) progressText.textContent = `${p.processed ?? 0} processed`;
+                    }
+                }).catch(() => {});
+                fetch('/scan/logs?n=200').then(r => r.json()).then(l => {
+                    stdoutPre.textContent = l.stdout || '';
+                    stderrPre.textContent = l.stderr || '';
+                }).catch(() => {});
+            }
+            setInterval(pollStatus, 2000);
+
+            btnStart.addEventListener('click', () => {
+                const payload = {
+                    area_id: scanAreaSelect.value || null,
+                    tiles_dir: tilesDirInput.value || 'tiles',
+                    model: modelInput.value || 'google/gemini-2.5-pro',
+                    rpm: Number(rpmInput.value || 60),
+                    min_confidence: Number(minConfInput.value || 0.5),
+                    context_radius: Number(ctxInput.value || 0),
+                    coarse_factor: Number(coarseFactorInput.value || 0),
+                    coarse_downscale: Number(coarseDownInput.value || 256),
+                    coarse_threshold: Number(coarseThreshInput.value || 0.3),
+                    limit: limitInput.value ? Number(limitInput.value) : null,
+                };
+                fetch('/scan/start', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify(payload),
+                }).then(r => r.json()).then(() => {
+                    pollStatus();
+                }).catch(() => {});
+            });
+
+            btnStop.addEventListener('click', () => {
+                if (confirm('Are you sure you want to stop the scan?')) {
+                    fetch('/scan/stop', {
+                        method: 'POST',
+                    }).then(r => r.json()).then(() => {
+                        pollStatus();
+                    }).catch(() => {});
+                }
+            });
         });
     </script>
 </body>

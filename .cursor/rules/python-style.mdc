@@ -1,0 +1,27 @@
+---
+globs: *.py
+description: Local Python conventions for scripts and Flask app in this repo
+---
+### Python Conventions (Repo-local)
+
+- **Typing and naming**
+  - Prefer explicit, descriptive names; avoid 1–2 char identifiers.
+  - Add type hints for function signatures when not burdensome.
+
+- **Control flow**
+  - Use early returns for guard clauses; handle edge cases first.
+  - Do not swallow exceptions silently; include minimal context when catching.
+
+- **I/O**
+  - Use UTF-8 explicitly for JSONL read/write where applicable.
+  - Flush file handles after writes for long-running loops.
+
+- **CLI scripts**
+  - Expose a `main()` with `argparse` and guard with `if __name__ == "__main__": main()`.
+  - Validate required environment variables early (e.g., `OPENROUTER_API_KEY`).
+
+- **HTTP calls**
+  - Identify with a lightweight User-Agent; respect rate limits and backoff.
+
+- **Large outputs**
+  - Avoid committing `tiles/`, `*.tiff`, `*.png`, and `*.jsonl`.

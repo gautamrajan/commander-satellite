@@ -7,6 +7,9 @@ import argparse
 import logging
 import mimetypes
 from typing import Generator, Iterable, Optional, Tuple, Dict, Any
+from io import BytesIO
+
+from PIL import Image as PILImage
 
 from langchain_openai import ChatOpenAI
 from langchain_core.messages import HumanMessage, SystemMessage
@@ -39,6 +42,17 @@ def encode_image_as_data_url(file_path: str) -> str:
     mime = determine_mime_type(file_path)
     with open(file_path, "rb") as f:
         b64 = base64.b64encode(f.read()).decode("ascii")
+    return f"data:{mime};base64,{b64}"
+
+
+def encode_pil_image_as_data_url(img: PILImage.Image, fmt: str = "JPEG", quality: int = 92) -> str:
+    buf = BytesIO()
+    save_kwargs = {"format": fmt}
+    if fmt.upper() in {"JPEG", "JPG"}:
+        save_kwargs["quality"] = quality
+    img.save(buf, **save_kwargs)
+    b64 = base64.b64encode(buf.getvalue()).decode("ascii")
+    mime = "image/jpeg" if fmt.upper() in {"JPEG", "JPG"} else f"image/{fmt.lower()}"
     return f"data:{mime};base64,{b64}"
 
 
@@ -123,16 +137,18 @@ def call_openrouter_with_image(
     rpm: float,
     last_call_time: Optional[float],
     max_retries: int = 3,
+    prompt_text: Optional[str] = None,
 ) -> Tuple[Optional[Dict[str, Any]], float, Dict[str, Any]]:
     """Send image using LangChain ChatOpenAI and return parsed JSON result and updated last_call_time.
 
     Returns (result_dict_or_none, last_call_time, info)
     """
     system_prompt = "Return ONLY JSON. No extra text."
-    prompt = (
+    default_prompt = (
         "Analyze the image. Respond ONLY with JSON: "
         "{\"dumpster\": true|false, \"confidence\": number between 0 and 1}."
     )
+    prompt = prompt_text or default_prompt
 
     attempt = 0
     last = last_call_time
@@ -211,6 +227,11 @@ def main() -> None:
     ap.add_argument("--limit", type=int, default=None, help="Limit the number of images to send.")
     ap.add_argument("--resume", action="store_true", help="Skip files already present in out/log_all.")
     ap.add_argument("--debug", action="store_true", help="Enable verbose debug logging to console.")
+    ap.add_argument("--context_radius", type=int, default=0, help="Neighborhood radius in tiles. 0 = disabled, 1 = 3x3, 2 = 5x5, ...")
+    ap.add_argument("--coarse_factor", type=int, default=0, help="If >1, run a coarse prefilter by stitching factor x factor tiles (e.g., 2 for 2x2).")
+    ap.add_argument("--coarse_downscale", type=int, default=256, help="Resize stitched coarse image to this size (square) before sending.")
+    ap.add_argument("--coarse_threshold", type=float, default=0.3, help="Confidence threshold for coarse positives that trigger refinement.")
+    ap.add_argument("--coarse_log", type=str, default=None, help="Optional JSONL to log coarse-stage results.")
 
     args = ap.parse_args()
 
@@ -249,6 +270,7 @@ def main() -> None:
     # Files opened lazily on first write
     out_fp = None
     log_all_fp = None
+    coarse_fp = None
 
     try:
         for image_path in iter_images(tiles_dir):
@@ -261,18 +283,258 @@ def main() -> None:
                 break
 
             z, x, y = parse_zxy(tiles_dir, image_path)
-            try:
-                data_url = encode_image_as_data_url(image_path)
-            except Exception as e:
-                print(f"Skip unreadable image {rel_path}: {e}", file=sys.stderr)
+
+            # Coarse prefilter path
+            if args.coarse_factor and args.coarse_factor > 1 and z is not None and x is not None and y is not None:
+                f = int(args.coarse_factor)
+                # Process only the top-left tile of each fxf block
+                if (x % f != 0) or (y % f != 0):
+                    continue
+
+                # Stitch fxf tiles
+                tile_size = 256
+                canvas = PILImage.new("RGB", (f*tile_size, f*tile_size), (255,255,255))
+                for j in range(f):
+                    for i in range(f):
+                        cx = x + i
+                        cy = y + j
+                        child_jpg = os.path.join(tiles_dir, str(z), str(cx), f"{cy}.jpg")
+                        child_png = os.path.join(tiles_dir, str(z), str(cx), f"{cy}.png")
+                        src_path = child_jpg if os.path.exists(child_jpg) else (child_png if os.path.exists(child_png) else None)
+                        if not src_path:
+                            continue
+                        try:
+                            img = PILImage.open(src_path).convert("RGB").resize((tile_size, tile_size), PILImage.BILINEAR)
+                            canvas.paste(img, (i*tile_size, j*tile_size))
+                        except Exception:
+                            pass
+
+                # Downscale for payload if requested
+                if args.coarse_downscale and args.coarse_downscale > 0:
+                    ds = int(args.coarse_downscale)
+                    canvas_to_send = canvas.resize((ds, ds), PILImage.BILINEAR)
+                else:
+                    canvas_to_send = canvas
+
+                coarse_data_url = encode_pil_image_as_data_url(canvas_to_send, fmt="JPEG", quality=85)
+                coarse_prompt = (
+                    "Analyze this stitched satellite image (multiple tiles). Respond ONLY with JSON: "
+                    "{\"dumpster\": true|false, \"confidence\": number between 0 and 1}."
+                )
+                result, last_call_time, info = call_openrouter_with_image(
+                    llm=llm,
+                    image_data_url=coarse_data_url,
+                    min_confidence=args.min_confidence,
+                    rpm=args.rpm,
+                    last_call_time=last_call_time,
+                    prompt_text=coarse_prompt,
+                )
+                sent += 1
+
+                # Lazy-open coarse log
+                if coarse_fp is None and args.coarse_log:
+                    coarse_fp = open(args.coarse_log, "a", encoding="utf-8")
+
+                coarse_conf: float = 0.0
+                coarse_pos = False
+                if isinstance(result, dict):
+                    try:
+                        coarse_conf = float(result.get("confidence"))
+                    except (TypeError, ValueError):
+                        coarse_conf = 0.0
+                    coarse_pos = bool(result.get("dumpster")) and (coarse_conf >= args.coarse_threshold)
+
+                if coarse_fp is not None:
+                    coarse_fp.write(json.dumps({
+                        "stage": "coarse",
+                        "z": z,
+                        "x": x,
+                        "y": y,
+                        "factor": f,
+                        "positive": coarse_pos,
+                        "confidence": coarse_conf,
+                        "model": args.model,
+                        "http_status": info.get("status"),
+                        "error": info.get("error"),
+                    }) + "\n")
+                    coarse_fp.flush()
+
+                # Refine on positive: scan children tiles normally (with optional context)
+                if coarse_pos:
+                    # Ensure files opened
+                    if log_all_fp is None and args.log_all:
+                        log_all_fp = open(args.log_all, "a", encoding="utf-8")
+                    if out_fp is None:
+                        out_fp = open(args.out, "a", encoding="utf-8")
+
+                    for j in range(f):
+                        for i in range(f):
+                            cx = x + i
+                            cy = y + j
+                            child_rel = os.path.join(str(z), str(cx), f"{cy}.jpg")
+                            if args.resume and child_rel in processed_paths:
+                                continue
+
+                            # Build input for child with context if requested
+                            stitched_data_url: Optional[str] = None
+                            prompt_text: Optional[str] = None
+                            if args.context_radius and args.context_radius > 0:
+                                r = int(args.context_radius)
+                                grid: list[list[Optional[PILImage.Image]]] = []
+                                for ddy in range(-r, r+1):
+                                    row: list[Optional[PILImage.Image]] = []
+                                    for ddx in range(-r, r+1):
+                                        px = cx + ddx
+                                        py = cy + ddy
+                                        neighbor_path = os.path.join(tiles_dir, str(z), str(px), f"{py}.jpg")
+                                        alt_png_path = os.path.join(tiles_dir, str(z), str(px), f"{py}.png")
+                                        chosen_path = neighbor_path if os.path.exists(neighbor_path) else (alt_png_path if os.path.exists(alt_png_path) else None)
+                                        if chosen_path:
+                                            try:
+                                                row.append(PILImage.open(chosen_path).convert("RGB"))
+                                            except Exception:
+                                                row.append(None)
+                                        else:
+                                            row.append(None)
+                                    grid.append(row)
+                                size = (2*r + 1) * 256
+                                canvas_c = PILImage.new("RGB", (size, size), (255,255,255))
+                                for jj, row in enumerate(grid):
+                                    for ii, img in enumerate(row):
+                                        if img is None:
+                                            continue
+                                        img_r = img.resize((256, 256), PILImage.BILINEAR)
+                                        canvas_c.paste(img_r, (ii*256, jj*256))
+                                stitched_data_url = encode_pil_image_as_data_url(canvas_c, fmt="JPEG", quality=88)
+                                prompt_text = (
+                                    "You are given a stitched grid of map tiles. Focus ONLY on the central tile region when deciding. "
+                                    "Respond ONLY with JSON: {\"dumpster\": true|false, \"confidence\": number between 0 and 1}."
+                                )
+                            else:
+                                child_abs = os.path.join(tiles_dir, child_rel)
+                                try:
+                                    stitched_data_url = encode_image_as_data_url(child_abs)
+                                except Exception as e:
+                                    print(f"Skip unreadable image {child_rel}: {e}", file=sys.stderr)
+                                    continue
+
+                            result_c, last_call_time, info_c = call_openrouter_with_image(
+                                llm=llm,
+                                image_data_url=stitched_data_url,
+                                min_confidence=args.min_confidence,
+                                rpm=args.rpm,
+                                last_call_time=last_call_time,
+                                prompt_text=prompt_text,
+                            )
+                            sent += 1
+
+                            # Write logs for child
+                            zc, xc, yc = z, cx, cy
+                            record_all: Dict[str, Any] = {
+                                "path": os.path.join(str(zc), str(xc), f"{yc}.jpg"),
+                                "z": zc,
+                                "x": xc,
+                                "y": yc,
+                                "model": args.model,
+                                "result_raw": result_c,
+                                "http_status": info_c.get("status"),
+                                "variant": info_c.get("variant"),
+                                "response_excerpt": info_c.get("response_excerpt"),
+                                "content_text_excerpt": info_c.get("content_text_excerpt"),
+                                "error": info_c.get("error"),
+                            }
+
+                            is_positive = False
+                            confidence_val: float = 0.0
+                            if isinstance(result_c, dict):
+                                dumpster = result_c.get("dumpster")
+                                confidence = result_c.get("confidence")
+                                try:
+                                    confidence_val = float(confidence)
+                                except (TypeError, ValueError):
+                                    confidence_val = 0.0
+                                is_positive = bool(dumpster) and (confidence_val >= args.min_confidence)
+
+                            if log_all_fp is not None:
+                                to_write = record_all.copy()
+                                to_write["positive"] = is_positive
+                                to_write["confidence"] = confidence_val
+                                log_all_fp.write(json.dumps(to_write) + "\n")
+                                log_all_fp.flush()
+
+                            if is_positive:
+                                out_line = {
+                                    "path": record_all["path"],
+                                    "z": zc,
+                                    "x": xc,
+                                    "y": yc,
+                                    "confidence": confidence_val,
+                                    "model": args.model,
+                                }
+                                out_fp.write(json.dumps(out_line) + "\n")
+                                out_fp.flush()
+
+                # Done with this block; move to next file
                 continue
+
+            # Regular per-tile scanning path (no coarse prefilter)
+            # Build input image: either the single tile or a stitched neighborhood
+            stitched_data_url: Optional[str] = None
+            prompt_text: Optional[str] = None
+            if z is not None and x is not None and y is not None and args.context_radius and args.context_radius > 0:
+                # Gather neighbors within [x-r..x+r], [y-r..y+r]
+                r = int(args.context_radius)
+                grid: list[list[Optional[PILImage.Image]]] = []
+                tile_size = 256
+                for dy in range(-r, r+1):
+                    row: list[Optional[PILImage.Image]] = []
+                    for dx in range(-r, r+1):
+                        px = x + dx
+                        py = y + dy
+                        neighbor_path = os.path.join(tiles_dir, str(z), str(px), f"{py}.jpg")
+                        alt_png_path = os.path.join(tiles_dir, str(z), str(px), f"{py}.png")
+                        chosen_path = None
+                        if os.path.exists(neighbor_path):
+                            chosen_path = neighbor_path
+                        elif os.path.exists(alt_png_path):
+                            chosen_path = alt_png_path
+                        if chosen_path:
+                            try:
+                                row.append(PILImage.open(chosen_path).convert("RGB"))
+                            except Exception:
+                                row.append(None)
+                        else:
+                            row.append(None)
+                    grid.append(row)
+
+                size = (2*r + 1) * tile_size
+                canvas = PILImage.new("RGB", (size, size), (255,255,255))
+                for j, row in enumerate(grid):
+                    for i, img in enumerate(row):
+                        if img is None:
+                            continue
+                        img_r = img.resize((tile_size, tile_size), PILImage.BILINEAR)
+                        canvas.paste(img_r, (i*tile_size, j*tile_size))
+
+                stitched_data_url = encode_pil_image_as_data_url(canvas, fmt="JPEG", quality=88)
+                prompt_text = (
+                    "You are given a stitched grid of map tiles. Focus ONLY on the central tile region when deciding. "
+                    "Respond ONLY with JSON: {\"dumpster\": true|false, \"confidence\": number between 0 and 1}."
+                )
+            else:
+                try:
+                    stitched_data_url = encode_image_as_data_url(image_path)
+                except Exception as e:
+                    print(f"Skip unreadable image {rel_path}: {e}", file=sys.stderr)
+                    continue
 
             result, last_call_time, info = call_openrouter_with_image(
                 llm=llm,
-                image_data_url=data_url,
+                image_data_url=stitched_data_url,
                 min_confidence=args.min_confidence,
                 rpm=args.rpm,
                 last_call_time=last_call_time,
+                prompt_text=prompt_text,
             )
             sent += 1
 
@@ -335,6 +597,8 @@ def main() -> None:
             out_fp.close()
         if log_all_fp is not None:
             log_all_fp.close()
+        if coarse_fp is not None:
+            coarse_fp.close()
 
 
 if __name__ == "__main__":

@@ -1,0 +1,50 @@
+---
+alwaysApply: true
+description: High-level map of the repository and how the major scripts and the review app fit together
+---
+### Project Structure Guide
+
+- **Imagery mosaic builder**: [grab_imagery.py](mdc:grab_imagery.py)
+  - Fetches Esri World Imagery tiles and writes a georeferenced GeoTIFF; can also save a z/x/y.jpg tile tree for downstream scanning.
+- **Tile scanner (LLM)**: [scan_dumpsters.py](mdc:scan_dumpsters.py)
+  - Iterates images under a tiles directory and calls OpenRouter (via LangChain) to classify dumpsters.
+- **Review web app (Flask)**: [review_app.py](mdc:review_app.py)
+  - Serves the UI defined in [templates/index.html](mdc:templates/index.html) and styles in [static/style.css](mdc:static/style.css).
+
+### Data + Outputs
+
+- **Tiles directory**: `tiles/`
+  - Expected structure is `tiles/z/x/y.jpg`. The review app serves images via `/image/<path>` from this directory.
+- **Scanner outputs**:
+  - Positives-only JSONL (default): `dumpsters.jsonl` (configurable via `--out`).
+  - All-results JSONL (recommended): `all_results.jsonl` (set via `--log_all all_results.jsonl`). The review app reads only this file.
+- **Review outputs**:
+  - `reviewed_results.jsonl` accumulates approvals/rejections.
+
+### Typical Flow
+
+1) Build a mosaic and optionally export tiles tree for scanning:
+
+```bash
+python grab_imagery.py --lat <LAT> --lon <LON> --area_sqmi <SQ_MI> \
+  --tiff out.tiff --png preview.png --save_tiles_dir tiles
+```
+
+2) Scan tiles with the LLM and write an all-results log the review app expects:
+
+```bash
+export OPENROUTER_API_KEY=...  # required
+python scan_dumpsters.py --tiles_dir tiles --out dumpsters.jsonl \
+  --log_all all_results.jsonl --rpm 60 --model google/gemini-2.5-pro
+```
+
+3) Review detections in the browser:
+
+```bash
+python review_app.py  # opens Flask app at http://127.0.0.1:5000/
+```
+
+### Notes
+
+- The review app filters from `all_results.jsonl` by `positive == true` and hides anything already listed in `reviewed_results.jsonl`.
+- Avoid checking large binary outputs (e.g., `tiles/`, `.tiff`, `.png`, `*.jsonl`) into version control.

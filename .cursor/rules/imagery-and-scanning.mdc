@@ -1,0 +1,32 @@
+---
+alwaysApply: false
+description: Operational notes for imagery fetching, tile storage, scanning with OpenRouter, and review workflow
+---
+### Imagery Fetching
+
+- **Source**: Esri World Imagery tiles via `IMAGERY_URL` in [grab_imagery.py](mdc:grab_imagery.py).
+- **Zoom**: Auto-probe highest available with `--auto_zoom`, then cap by `--max_edge_px`.
+- **Placeholders**: Tiles that are uniform/near-uniform gray are treated as missing; script optionally substitutes a parent tile or fills white.
+- **Outputs**:
+  - GeoTIFF with EPSG:3857 and proper transform.
+  - Optional preview PNG (~4k edge).
+  - Optional `--save_tiles_dir` produces `z/x/y.jpg` for scanning.
+
+### Scanning with OpenRouter (LLM)
+
+- Script: [scan_dumpsters.py](mdc:scan_dumpsters.py)
+- Requirements: `OPENROUTER_API_KEY` env, model defaults to `google/gemini-2.5-pro`.
+- Emits:
+  - Positives-only JSONL: `--out` (default `dumpsters.jsonl`).
+  - All-results JSONL: `--log_all all_results.jsonl` recommended for review.
+- Rate limiting via `--rpm`; exponential backoff on transient errors.
+
+### Review App
+
+- Flask app: [review_app.py](mdc:review_app.py)
+- UI: [templates/index.html](mdc:templates/index.html), CSS: [static/style.css](mdc:static/style.css)
+- Endpoints:
+  - `GET /` UI
+  - `GET /detections` returns positives from `all_results.jsonl` minus any in `reviewed_results.jsonl`
+  - `GET /image/<path>` serves from `tiles/`
+  - `POST /review` appends to `reviewed_results.jsonl`
