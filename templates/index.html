@@ -60,6 +60,7 @@
                 <div id="button-container">
                     <button id="reject-btn">Reject</button>
                     <button id="approve-btn">Approve</button>
+                    <button id="annotate-btn">Annotate</button>
                 </div>
             </div>
             <div id="no-more-detections" style="display: none;">
@@ -110,6 +111,7 @@
                         <div class="tile-detail-actions">
                             <button id="tile-approve">Approve</button>
                             <button id="tile-reject">Reject</button>
+                            <button id="tile-annotate">Annotate</button>
                         </div>
                     </div>
                     <h3>Legend</h3>
@@ -139,6 +141,39 @@
                 </div>
                 <div class="fullscreen-grid">
                     <div id="mosaic-grid-full" style="display:grid; grid-auto-rows: var(--tile-size);"></div>
+                </div>
+            </div>
+        </div>
+
+        <!-- Annotation Modal -->
+        <div id="annotation-modal" class="annotation-overlay" role="dialog" aria-modal="true">
+            <div class="annotation-inner">
+                <div class="annotation-toolbar">
+                    <div class="left">
+                        <label>Context</label>
+                        <select id="ann-context-radius">
+                            <option value="0">Center only</option>
+                            <option value="1" selected>3x3</option>
+                            <option value="2">5x5</option>
+                        </select>
+                        <span class="sep"></span>
+                        <label>Label</label>
+                        <input id="ann-label" type="text" value="dumpster" placeholder="label for new box" />
+                        <span class="hint">Click and drag on the canvas to add a box. Click a box in the list to select. Delete to remove.</span>
+                    </div>
+                    <div class="right">
+                        <button id="ann-cancel">Close</button>
+                        <button id="ann-save" class="primary">Save</button>
+                    </div>
+                </div>
+                <div class="annotation-layout">
+                    <div class="canvas-wrap">
+                        <canvas id="annotation-canvas" width="768" height="768"></canvas>
+                    </div>
+                    <aside class="boxes-panel">
+                        <div class="panel-head">Boxes</div>
+                        <div id="ann-boxes-list" class="boxes-list"></div>
+                    </aside>
                 </div>
             </div>
         </div>
@@ -435,6 +470,7 @@
             refreshAreas();
             const approveBtn = document.getElementById("approve-btn");
             const rejectBtn = document.getElementById("reject-btn");
+            const annotateBtn = document.getElementById("annotate-btn");
             const reviewArea = document.getElementById("review-area");
             const noMoreDetections = document.getElementById("no-more-detections");
 
@@ -476,6 +512,12 @@
 
             approveBtn.addEventListener("click", () => review(true));
             rejectBtn.addEventListener("click", () => review(false));
+            if (annotateBtn) annotateBtn.addEventListener("click", () => {
+                const d = detections[currentIndex];
+                if (!d) return;
+                const areaId = areaSelectReview.value || '';
+                openAnnotationModal({ areaId, path: d.path, z: d.z, x: d.x, y: d.y });
+            });
             areaSelectReview.addEventListener('change', loadDetectionsForArea);
             areaSelectMosaic.addEventListener('change', loadMosaicZoomsForArea);
 
@@ -602,6 +644,7 @@
             const tileRevEl = document.getElementById('tile-detail-review');
             const tileApproveBtn = document.getElementById('tile-approve');
             const tileRejectBtn = document.getElementById('tile-reject');
+            const tileAnnotateBtn = document.getElementById('tile-annotate');
             let currentTileData = null;
 
             function showTileDetail(tileEl, t) {
@@ -632,6 +675,17 @@
             }
             if (tileApproveBtn) tileApproveBtn.addEventListener('click', () => postReviewForTile(true));
             if (tileRejectBtn) tileRejectBtn.addEventListener('click', () => postReviewForTile(false));
+            if (tileAnnotateBtn) tileAnnotateBtn.addEventListener('click', () => {
+                if (!currentTileData) return;
+                const areaId = areaSelectMosaic.value || '';
+                // Ensure z is present; if missing, pull from zoom select
+                let zVal = currentTileData.z;
+                if (zVal === undefined || zVal === null) {
+                    const zParsed = parseInt(document.getElementById('zoom-select').value, 10);
+                    if (!isNaN(zParsed)) zVal = zParsed;
+                }
+                openAnnotationModal({ areaId, path: currentTileData.path, z: zVal, x: currentTileData.x, y: currentTileData.y });
+            });
             const mosaicRefreshBtn = document.getElementById('mosaic-refresh');
             if (mosaicRefreshBtn) {
                 mosaicRefreshBtn.addEventListener('click', () => {
@@ -911,6 +965,445 @@
                         pollStatus();
                     }).catch(() => {});
                 }
+            });
+
+            // ===================== Annotation logic =====================
+            const annModal = document.getElementById('annotation-modal');
+            const annCanvas = document.getElementById('annotation-canvas');
+            const annCtx = annCanvas.getContext('2d');
+            const annCloseBtn = document.getElementById('ann-cancel');
+            const annSaveBtn = document.getElementById('ann-save');
+            const annRadiusSelect = document.getElementById('ann-context-radius');
+            const annLabelInput = document.getElementById('ann-label');
+            const annBoxesList = document.getElementById('ann-boxes-list');
+
+            // Offscreen background canvas for stitched tiles
+            const annBgCanvas = document.createElement('canvas');
+            const annBgCtx = annBgCanvas.getContext('2d');
+
+            let annState = {
+                areaId: '',
+                path: '',
+                z: null,
+                x: null,
+                y: null,
+                r: 1,
+                boxes: [], // { cx, cy, w, h, angle_deg, label }
+                selectedIdx: -1,
+                mode: null, // 'draw' | 'move' | 'rotate'
+                startX: 0,
+                startY: 0,
+                lastX: 0,
+                lastY: 0,
+                resizeCornerIdx: -1,
+                resizeOppLocal: null,
+                resizeOppWorld: null,
+                resizeAngle: 0
+            };
+
+            function openAnnotationModal({ areaId, path, z, x, y }) {
+                annState.areaId = areaId || '';
+                annState.path = path;
+                annState.z = z; annState.x = x; annState.y = y;
+                annState.r = parseInt(annRadiusSelect.value, 10) || 1;
+                annState.boxes = [];
+                annState.selectedIdx = -1;
+                // Resize canvas to context grid size
+                const size = (2 * annState.r + 1) * 256;
+                annCanvas.width = size; annCanvas.height = size;
+                annBgCanvas.width = size; annBgCanvas.height = size;
+                annModal.classList.add('active');
+                composeBackground().then(() => {
+                    loadExistingBoxes();
+                });
+            }
+
+            function closeAnnotationModal() {
+                annModal.classList.remove('active');
+            }
+
+            function getImageUrl(z, x, y) {
+                const p = `${z}/${x}/${y}.jpg`;
+                if (annState.areaId) return `/areas/${annState.areaId}/image/${p}`;
+                return `/image/${p}`;
+            }
+
+            async function composeBackground() {
+                // Draw grid of neighbors
+                const size = (2 * annState.r + 1) * 256;
+                annBgCtx.fillStyle = '#111';
+                annBgCtx.fillRect(0, 0, size, size);
+                for (let dy = -annState.r; dy <= annState.r; dy++) {
+                    for (let dx = -annState.r; dx <= annState.r; dx++) {
+                        const px = annState.x + dx;
+                        const py = annState.y + dy;
+                        const sx = (dx + annState.r) * 256;
+                        const sy = (dy + annState.r) * 256;
+                        // Try .jpg then fallback to .png
+                        const urlJpg = getImageUrl(annState.z, px, py);
+                        const urlPng = urlJpg.replace(/\.jpg$/i, '.png');
+                        await new Promise(resolve => {
+                            const img = new Image();
+                            img.onload = () => { annBgCtx.drawImage(img, sx, sy, 256, 256); resolve(); };
+                            img.onerror = () => {
+                                const img2 = new Image();
+                                img2.onload = () => { annBgCtx.drawImage(img2, sx, sy, 256, 256); resolve(); };
+                                img2.onerror = () => { resolve(); };
+                                img2.src = urlPng;
+                            };
+                            img.src = urlJpg;
+                        });
+                    }
+                }
+                drawGridAndBoxes();
+            }
+
+            function drawGridAndBoxes() {
+                const size = annCanvas.width;
+                // Clear and draw background
+                annCtx.clearRect(0, 0, size, size);
+                annCtx.drawImage(annBgCanvas, 0, 0);
+                // Grid lines for tiles
+                annCtx.save();
+                annCtx.strokeStyle = 'rgba(255,255,255,0.3)';
+                annCtx.lineWidth = 1;
+                for (let p = 0; p <= size; p += 256) {
+                    annCtx.beginPath(); annCtx.moveTo(p + 0.5, 0); annCtx.lineTo(p + 0.5, size); annCtx.stroke();
+                    annCtx.beginPath(); annCtx.moveTo(0, p + 0.5); annCtx.lineTo(size, p + 0.5); annCtx.stroke();
+                }
+                // Highlight center tile
+                const cs = annState.r * 256;
+                annCtx.strokeStyle = 'rgba(255,215,0,0.9)';
+                annCtx.lineWidth = 2;
+                annCtx.strokeRect(cs + 1, cs + 1, 254, 254);
+                annCtx.restore();
+
+                // Draw boxes (oriented)
+                for (let i = 0; i < annState.boxes.length; i++) {
+                    const b = annState.boxes[i];
+                    const sel = i === annState.selectedIdx;
+                    const angleRad = (b.angle_deg || 0) * Math.PI / 180;
+                    annCtx.save();
+                    annCtx.translate(b.cx, b.cy);
+                    annCtx.rotate(angleRad);
+                    annCtx.strokeStyle = sel ? 'rgba(0, 200, 255, 1)' : 'rgba(255, 0, 0, 0.9)';
+                    annCtx.lineWidth = sel ? 3 : 2;
+                    annCtx.strokeRect(-b.w/2, -b.h/2, b.w, b.h);
+                    // label tag (unrotated for readability)
+                    const tag = b.label || '';
+                    if (tag) {
+                        annCtx.save();
+                        annCtx.rotate(-angleRad);
+                        annCtx.font = '12px sans-serif';
+                        const tw = annCtx.measureText(tag).width + 8;
+                        const lx = -b.w/2;
+                        const ly = -b.h/2 - 16;
+                        annCtx.fillStyle = 'rgba(0,0,0,0.6)';
+                        annCtx.fillRect(lx, ly, tw, 16);
+                        annCtx.fillStyle = '#fff';
+                        annCtx.fillText(tag, lx + 4, ly + 12);
+                        annCtx.restore();
+                    }
+                    // rotate handle when selected
+                    if (sel) {
+                        const handleOffset = 18;
+                        const hx = 0;
+                        const hy = -b.h/2 - handleOffset;
+                        annCtx.fillStyle = '#00bcd4';
+                        annCtx.beginPath(); annCtx.arc(hx, hy, 5, 0, Math.PI*2); annCtx.fill();
+                        annCtx.beginPath(); annCtx.moveTo(0, -b.h/2); annCtx.lineTo(0, hy); annCtx.stroke();
+                        // corner resize handles
+                        const corners = [
+                            {x: -b.w/2, y: -b.h/2},
+                            {x:  b.w/2, y: -b.h/2},
+                            {x:  b.w/2, y:  b.h/2},
+                            {x: -b.w/2, y:  b.h/2},
+                        ];
+                        annCtx.fillStyle = '#ffffff';
+                        annCtx.strokeStyle = '#333';
+                        for (const c of corners) {
+                            annCtx.beginPath();
+                            annCtx.rect(c.x - 4, c.y - 4, 8, 8);
+                            annCtx.fill();
+                            annCtx.stroke();
+                        }
+                    }
+                    annCtx.restore();
+                }
+                renderBoxesList();
+            }
+
+            function renderBoxesList() {
+                annBoxesList.innerHTML = '';
+                if (!annState.boxes.length) {
+                    const empty = document.createElement('div');
+                    empty.className = 'empty';
+                    empty.textContent = 'No boxes yet';
+                    annBoxesList.appendChild(empty);
+                    return;
+                }
+                annState.boxes.forEach((b, idx) => {
+                    const row = document.createElement('div');
+                    row.className = 'box-row' + (idx === annState.selectedIdx ? ' selected' : '');
+                    const label = document.createElement('input');
+                    label.type = 'text';
+                    label.value = b.label || '';
+                    label.placeholder = 'label';
+                    label.addEventListener('input', () => { b.label = label.value; drawGridAndBoxes(); });
+                    const angle = document.createElement('input');
+                    angle.type = 'number'; angle.step = '1'; angle.min = '-180'; angle.max = '180';
+                    angle.value = Math.round(b.angle_deg || 0);
+                    angle.title = 'angle (deg)';
+                    angle.addEventListener('input', () => { b.angle_deg = parseFloat(angle.value) || 0; drawGridAndBoxes(); });
+                    const meta = document.createElement('div');
+                    meta.className = 'meta';
+                    meta.textContent = `cx:${Math.round(b.cx)}, cy:${Math.round(b.cy)}, w:${Math.round(b.w)}, h:${Math.round(b.h)}, θ:${Math.round(b.angle_deg||0)}°`;
+                    const del = document.createElement('button');
+                    del.textContent = 'Delete';
+                    del.className = 'danger';
+                    del.addEventListener('click', () => { annState.boxes.splice(idx,1); annState.selectedIdx = -1; drawGridAndBoxes(); });
+                    row.appendChild(label);
+                    row.appendChild(angle);
+                    row.appendChild(meta);
+                    row.appendChild(del);
+                    row.addEventListener('click', () => { annState.selectedIdx = idx; drawGridAndBoxes(); });
+                    annBoxesList.appendChild(row);
+                });
+            }
+
+            // Mouse interactions to create a box
+            function getMousePos(e) {
+                const rect = annCanvas.getBoundingClientRect();
+                return { x: e.clientX - rect.left, y: e.clientY - rect.top };
+            }
+
+            function pointInRotRect(px, py, b) {
+                const ang = -(b.angle_deg || 0) * Math.PI / 180;
+                const dx = px - b.cx; const dy = py - b.cy;
+                const rx = dx * Math.cos(ang) - dy * Math.sin(ang);
+                const ry = dx * Math.sin(ang) + dy * Math.cos(ang);
+                return Math.abs(rx) <= b.w/2 && Math.abs(ry) <= b.h/2;
+            }
+
+            function worldToLocal(px, py, b) {
+                const ang = -(b.angle_deg || 0) * Math.PI / 180;
+                const dx = px - b.cx; const dy = py - b.cy;
+                return {
+                    x: dx * Math.cos(ang) - dy * Math.sin(ang),
+                    y: dx * Math.sin(ang) + dy * Math.cos(ang),
+                };
+            }
+
+            function localToWorld(lx, ly, b) {
+                const ang = (b.angle_deg || 0) * Math.PI / 180;
+                return {
+                    x: b.cx + lx * Math.cos(ang) - ly * Math.sin(ang),
+                    y: b.cy + lx * Math.sin(ang) + ly * Math.cos(ang),
+                };
+            }
+
+            function nearRotateHandle(px, py, b) {
+                const angleRad = (b.angle_deg || 0) * Math.PI / 180;
+                // Local handle at (0, -h/2 - offset) transformed to world coords
+                const offset = 18;
+                const hx = b.cx - (b.h/2 + offset) * Math.sin(angleRad);
+                const hy = b.cy + (-b.h/2 - offset) * Math.cos(angleRad);
+                const dist2 = (px - hx) * (px - hx) + (py - hy) * (py - hy);
+                return dist2 <= 10 * 10;
+            }
+
+            function findRotateHandleAt(px, py) {
+                for (let i = annState.boxes.length - 1; i >= 0; i--) {
+                    if (nearRotateHandle(px, py, annState.boxes[i])) return i;
+                }
+                return -1;
+            }
+
+            function findBoxAt(px, py) {
+                for (let i = annState.boxes.length - 1; i >= 0; i--) {
+                    if (pointInRotRect(px, py, annState.boxes[i])) return i;
+                }
+                return -1;
+            }
+
+            function findResizeCornerAt(px, py) {
+                for (let i = annState.boxes.length - 1; i >= 0; i--) {
+                    const b = annState.boxes[i];
+                    const corners = [
+                        {x: -b.w/2, y: -b.h/2},
+                        {x:  b.w/2, y: -b.h/2},
+                        {x:  b.w/2, y:  b.h/2},
+                        {x: -b.w/2, y:  b.h/2},
+                    ];
+                    for (let ci = 0; ci < 4; ci++) {
+                        const wc = localToWorld(corners[ci].x, corners[ci].y, b);
+                        const dist2 = (px - wc.x) * (px - wc.x) + (py - wc.y) * (py - wc.y);
+                        if (dist2 <= 9 * 9) return { idx: i, corner: ci };
+                    }
+                }
+                return { idx: -1, corner: -1 };
+            }
+
+            annCanvas.addEventListener('mousedown', (e) => {
+                if (e.button !== 0) return;
+                const { x, y } = getMousePos(e);
+                annState.startX = x; annState.startY = y; annState.lastX = x; annState.lastY = y;
+                // Prefer rotate handle hit
+                let idx = findRotateHandleAt(x, y);
+                if (idx !== -1) {
+                    annState.selectedIdx = idx;
+                    annState.mode = 'rotate';
+                    e.preventDefault(); return;
+                }
+                // Then corner resize handle
+                const hit = findResizeCornerAt(x, y);
+                if (hit.idx !== -1) {
+                    annState.selectedIdx = hit.idx;
+                    annState.mode = 'resize';
+                    annState.resizeCornerIdx = hit.corner;
+                    const b = annState.boxes[annState.selectedIdx];
+                    const cornersLocal = [
+                        {x: -b.w/2, y: -b.h/2}, {x: b.w/2, y: -b.h/2}, {x: b.w/2, y: b.h/2}, {x: -b.w/2, y: b.h/2}
+                    ];
+                    const opp = (hit.corner + 2) % 4;
+                    annState.resizeOppLocal = { x: cornersLocal[opp].x, y: cornersLocal[opp].y };
+                    annState.resizeOppWorld = localToWorld(cornersLocal[opp].x, cornersLocal[opp].y, b);
+                    annState.resizeAngle = b.angle_deg || 0;
+                    e.preventDefault(); return;
+                }
+                // Then box body hit (move)
+                idx = findBoxAt(x, y);
+                if (idx !== -1) {
+                    annState.selectedIdx = idx;
+                    annState.mode = 'move';
+                    e.preventDefault(); return;
+                }
+                // Else draw new
+                annState.mode = 'draw';
+                const label = annLabelInput.value.trim();
+                const newBox = { cx: x, cy: y, w: 0, h: 0, angle_deg: 0, label };
+                annState.selectedIdx = annState.boxes.length;
+                annState.boxes.push(newBox);
+                e.preventDefault();
+            });
+
+            annCanvas.addEventListener('mousemove', (e) => {
+                if (!annState.mode) return;
+                const { x, y } = getMousePos(e);
+                const b = annState.boxes[annState.selectedIdx];
+                if (!b) return;
+                if (annState.mode === 'draw') {
+                    // Axis-aligned during draw
+                    b.w = Math.abs(x - annState.startX);
+                    b.h = Math.abs(y - annState.startY);
+                    b.cx = (x + annState.startX) / 2;
+                    b.cy = (y + annState.startY) / 2;
+                } else if (annState.mode === 'move') {
+                    const dx = x - annState.lastX; const dy = y - annState.lastY;
+                    b.cx += dx; b.cy += dy;
+                } else if (annState.mode === 'rotate') {
+                    const ang = Math.atan2(y - b.cy, x - b.cx) + Math.PI / 2; // 0° at top
+                    b.angle_deg = (ang * 180 / Math.PI);
+                } else if (annState.mode === 'resize') {
+                    // Anchor opposite corner in world space captured on mousedown
+                    const oppW = annState.resizeOppWorld;
+                    const angle = (annState.resizeAngle || 0) * Math.PI / 180;
+                    const vwx = x - oppW.x; const vwy = y - oppW.y; // vector from opposite to cursor in world
+                    // Rotate into box local frame with inverse rotation
+                    const cosA = Math.cos(angle); const sinA = Math.sin(angle);
+                    const lx = vwx * cosA + vwy * sinA;
+                    const ly = -vwx * sinA + vwy * cosA;
+                    const minSize = 6;
+                    const newW = Math.max(minSize, Math.abs(lx));
+                    const newH = Math.max(minSize, Math.abs(ly));
+                    // New center is midpoint in world space
+                    b.cx = oppW.x + vwx / 2; b.cy = oppW.y + vwy / 2;
+                    b.w = newW; b.h = newH;
+                }
+                annState.lastX = x; annState.lastY = y;
+                drawGridAndBoxes();
+            });
+
+            window.addEventListener('mouseup', () => { annState.mode = null; });
+
+            function loadExistingBoxes() {
+                const url = annState.areaId ? `/areas/${annState.areaId}/annotations?path=${encodeURIComponent(annState.path)}` : `/annotations?path=${encodeURIComponent(annState.path)}`;
+                fetch(url).then(r=>r.json()).then(obj => {
+                    const boxes = Array.isArray(obj.boxes) ? obj.boxes : [];
+                    // Map to oriented box model; prefer center-based fields when present
+                    annState.boxes = boxes.map(b => {
+                        const angle = (typeof b.angle_deg === 'number') ? b.angle_deg : 0;
+                        if (typeof b.ncx === 'number' && typeof b.ncy === 'number' && typeof b.nw === 'number' && typeof b.nh === 'number') {
+                            return { cx: b.ncx*annCanvas.width, cy: b.ncy*annCanvas.height, w: b.nw*annCanvas.width, h: b.nh*annCanvas.height, angle_deg: angle, label: b.label };
+                        }
+                        if (typeof b.cx === 'number' && typeof b.cy === 'number' && typeof b.w === 'number' && typeof b.h === 'number') {
+                            return { cx: b.cx, cy: b.cy, w: b.w, h: b.h, angle_deg: angle, label: b.label };
+                        }
+                        // Legacy axis-aligned (x,y,w,h or normalized nx,ny,nw,nh)
+                        if (typeof b.nx === 'number' && typeof b.ny === 'number' && typeof b.nw === 'number' && typeof b.nh === 'number') {
+                            const x = b.nx*annCanvas.width, y = b.ny*annCanvas.height, w = b.nw*annCanvas.width, h = b.nh*annCanvas.height;
+                            return { cx: x + w/2, cy: y + h/2, w, h, angle_deg: 0, label: b.label };
+                        }
+                        if (typeof b.x === 'number' && typeof b.y === 'number' && typeof b.w === 'number' && typeof b.h === 'number') {
+                            return { cx: b.x + b.w/2, cy: b.y + b.h/2, w: b.w, h: b.h, angle_deg: 0, label: b.label };
+                        }
+                        return { cx: 0, cy: 0, w: 0, h: 0, angle_deg: 0, label: b.label };
+                    });
+                    drawGridAndBoxes();
+                }).catch(()=>{ drawGridAndBoxes(); });
+            }
+
+            function saveBoxes() {
+                const payload = {
+                    path: annState.path,
+                    z: annState.z,
+                    x: annState.x,
+                    y: annState.y,
+                    context_radius: annState.r,
+                    canvas_size: { width: annCanvas.width, height: annCanvas.height },
+                    boxes: annState.boxes.map(b => {
+                        const ang = (b.angle_deg || 0) * Math.PI / 180;
+                        // Oriented polygon (clockwise starting top-left in box frame)
+                        const corners = [
+                            {x: -b.w/2, y: -b.h/2},
+                            {x:  b.w/2, y: -b.h/2},
+                            {x:  b.w/2, y:  b.h/2},
+                            {x: -b.w/2, y:  b.h/2},
+                        ].map(p => ({
+                            x: b.cx + p.x * Math.cos(ang) - p.y * Math.sin(ang),
+                            y: b.cy + p.x * Math.sin(ang) + p.y * Math.cos(ang),
+                        }));
+                        const minX = Math.min(...corners.map(p=>p.x));
+                        const maxX = Math.max(...corners.map(p=>p.x));
+                        const minY = Math.min(...corners.map(p=>p.y));
+                        const maxY = Math.max(...corners.map(p=>p.y));
+                        const aabb = { x: minX, y: minY, w: (maxX-minX), h: (maxY-minY) };
+                        return {
+                            // center-based oriented box
+                            cx: b.cx, cy: b.cy, w: b.w, h: b.h, angle_deg: b.angle_deg || 0,
+                            ncx: b.cx / annCanvas.width, ncy: b.cy / annCanvas.height, nw: b.w / annCanvas.width, nh: b.h / annCanvas.height,
+                            // legacy AABB for compatibility
+                            x: aabb.x, y: aabb.y, w_aabb: aabb.w, h_aabb: aabb.h,
+                            nx: aabb.x / annCanvas.width, ny: aabb.y / annCanvas.height, nw_aabb: aabb.w / annCanvas.width, nh_aabb: aabb.h / annCanvas.height,
+                            // polygon (normalized)
+                            poly: corners.map(p => [p.x / annCanvas.width, p.y / annCanvas.height]),
+                            label: b.label || ''
+                        };
+                    })
+                };
+                const url = annState.areaId ? `/areas/${annState.areaId}/annotations` : '/annotations';
+                fetch(url, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload) })
+                    .then(() => closeAnnotationModal());
+            }
+
+            annCloseBtn.addEventListener('click', closeAnnotationModal);
+            annSaveBtn.addEventListener('click', saveBoxes);
+            annRadiusSelect.addEventListener('change', () => {
+                annState.r = parseInt(annRadiusSelect.value, 10) || 0;
+                const size = (2 * annState.r + 1) * 256;
+                annCanvas.width = size; annCanvas.height = size;
+                annBgCanvas.width = size; annBgCanvas.height = size;
+                composeBackground();
             });
         });
     </script>

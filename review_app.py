@@ -13,6 +13,7 @@ app = Flask(__name__)
 TILES_DIR = os.path.abspath("tiles")
 ALL_RESULTS_FILE = "all_results.jsonl"
 REVIEWED_RESULTS_FILE = "reviewed_results.jsonl"
+ANNOTATIONS_FILE = "annotations.jsonl"
 
 # AOI runs directory and registry
 RUNS_DIR = os.path.abspath("runs")
@@ -66,6 +67,7 @@ def area_paths(area_id: str) -> dict:
         "all_results": os.path.join(base, "all_results.jsonl"),
         "dumpsters": os.path.join(base, "dumpsters.jsonl"),
         "reviewed": os.path.join(base, "reviewed_results.jsonl"),
+        "annotations": os.path.join(base, "annotations.jsonl"),
         "coarse": os.path.join(base, "coarse.jsonl"),
         "logs": os.path.join(base, "logs"),
         "fetch_stdout": os.path.join(base, "logs", "fetch.out.log"),
@@ -242,6 +244,41 @@ def tail_lines(path: str, max_lines: int = 100) -> str:
         return ""
 
 
+# ---- Annotations helpers ----
+def _append_jsonl(path: str, obj: dict) -> None:
+    """Append a single JSON object as a line to a JSONL file (UTF-8)."""
+    os.makedirs(os.path.dirname(os.path.abspath(path)) or ".", exist_ok=True)
+    with open(path, "a", encoding="utf-8") as f:
+        f.write(json.dumps(obj) + "\n")
+
+
+def _load_latest_annotation_for_path(path_to_jsonl: str, image_rel_path: str) -> dict:
+    """Return the most recent annotation object for a given tile path from a JSONL file.
+
+    If none exists, return a default structure with empty boxes.
+    """
+    latest = None
+    try:
+        with open(path_to_jsonl, "r", encoding="utf-8", errors="ignore") as f:
+            for line in f:
+                try:
+                    obj = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if obj.get("path") == image_rel_path:
+                    latest = obj
+    except FileNotFoundError:
+        pass
+    except Exception:
+        pass
+    if latest is None:
+        latest = {"path": image_rel_path, "boxes": []}
+    # Ensure boxes array exists
+    if not isinstance(latest.get("boxes"), list):
+        latest["boxes"] = []
+    return latest
+
+
 # ---- Utility helpers for progress ----
 def _count_tiles_under(root: str) -> int:
     count = 0
@@ -362,6 +399,7 @@ def list_tiles_at_zoom(z: int):
 			positive = bool(meta.get("positive")) if meta else False
 			confidence = meta.get("confidence") if meta else None
 			tiles.append({
+				"z": z,
 				"x": x_val,
 				"y": y_val,
 				"path": rel_path.replace("\\", "/"),
@@ -448,6 +486,7 @@ def list_tiles_at_zoom_for_area(area_id: str, z: int):
 			positive = bool(meta.get("positive")) if meta else False
 			confidence = meta.get("confidence") if meta else None
 			tiles.append({
+				"z": z,
 				"x": x_val,
 				"y": y_val,
 				"path": rel_path.replace("\\", "/"),
@@ -1093,6 +1132,58 @@ def toggle_review_status():
         "approved": new_approved,
         "reviewed": True
     })
+
+
+# -------- Annotations (global legacy) --------
+@app.route("/annotations", methods=["GET"])
+def annotations_get_global():
+    image_path = request.args.get("path")
+    if not image_path:
+        return jsonify({"error": "path required"}), 400
+    latest = _load_latest_annotation_for_path(ANNOTATIONS_FILE, image_path)
+    return jsonify(latest)
+
+
+@app.route("/annotations", methods=["POST"])
+def annotations_post_global():
+    payload = request.get_json(force=True) or {}
+    image_path = payload.get("path")
+    if not image_path:
+        return jsonify({"error": "path required"}), 400
+    # Minimal validation; ensure boxes is a list
+    boxes = payload.get("boxes")
+    if boxes is None or not isinstance(boxes, list):
+        return jsonify({"error": "boxes list required"}), 400
+    # Append with timestamp if missing
+    payload.setdefault("created_at", time.time())
+    _append_jsonl(ANNOTATIONS_FILE, payload)
+    return jsonify({"status": "ok"})
+
+
+# -------- Annotations (AOI-scoped) --------
+@app.route("/areas/<area_id>/annotations", methods=["GET"])
+def annotations_get_area(area_id: str):
+    p = area_paths(area_id)
+    image_path = request.args.get("path")
+    if not image_path:
+        return jsonify({"error": "path required"}), 400
+    latest = _load_latest_annotation_for_path(p["annotations"], image_path)
+    return jsonify(latest)
+
+
+@app.route("/areas/<area_id>/annotations", methods=["POST"])
+def annotations_post_area(area_id: str):
+    p = area_paths(area_id)
+    payload = request.get_json(force=True) or {}
+    image_path = payload.get("path")
+    if not image_path:
+        return jsonify({"error": "path required"}), 400
+    boxes = payload.get("boxes")
+    if boxes is None or not isinstance(boxes, list):
+        return jsonify({"error": "boxes list required"}), 400
+    payload.setdefault("created_at", time.time())
+    _append_jsonl(p["annotations"], payload)
+    return jsonify({"status": "ok"})
 
 
 if __name__ == "__main__":

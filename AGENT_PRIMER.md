@@ -32,6 +32,13 @@ This document orients AI agents picking up development. It summarizes architectu
 - `reviewed_results.jsonl` (human review)
   - `{ "path":"z/x/y.jpg", "approved":bool }`
 
+- `annotations.jsonl` (human annotations)
+  - Append-only; latest line for a `path` is authoritative
+  - Oriented box with center/size/angle and normalized fields, plus AABB and polygon:
+    - Box: `{ cx, cy, w, h, angle_deg, ncx, ncy, nw, nh, poly:[[nx,ny]×4], label }`
+    - AABB fallback: `{ x, y, w_aabb, h_aabb, nx, ny, nw_aabb, nh_aabb }`
+  - Location: AOI `runs/<AREA_ID>/annotations.jsonl`, legacy root `annotations.jsonl`
+
 Notes:
 - Review app hides already-reviewed positives from `/detections`.
 - Mosaic overlays: AI-positive/negative (unreviewed) vs human-reviewed approved/rejected.
@@ -47,6 +54,8 @@ Global (legacy) endpoints:
 - `GET /mosaic/zooms` / `GET /mosaic/tiles/{z}` / `GET /image/{path}`
 - `GET /detections` – positives minus reviewed (legacy)
 - `POST /review` / `POST /review/toggle`
+ - `GET /annotations?path=z/x/y.jpg` – latest annotations for a tile
+ - `POST /annotations` – append a snapshot
 
 Area-scoped endpoints (preferred):
 - Areas
@@ -73,6 +82,8 @@ Area-scoped endpoints (preferred):
   - `GET /areas/{area_id}/detections` – positives minus reviewed
   - `POST /areas/{area_id}/review` – `{ path, approved }`
   - `POST /areas/{area_id}/review/toggle` – `{ path }` (toggle or set with `approved`)
+  - `GET /areas/{area_id}/annotations?path=z/x/y.jpg` – latest annotations
+  - `POST /areas/{area_id}/annotations` – append snapshot `{ path, z, x, y, context_radius, canvas_size, boxes:[...] }`
 
 ---
 
@@ -85,9 +96,11 @@ Area-scoped endpoints (preferred):
 - Mosaic tab
   - Area selector → Zoom selector → Filter (AI+, AI−, Reviewed Approved/Rejected, All).
   - Sidebar shows area summary counts, legend; click tiles to toggle review in-place.
+  - Annotate a selected tile: opens oriented-bbox modal (draw, move, rotate, resize, label; save to `annotations.jsonl`).
 
 - Review tab
   - Area selector; step through unreviewed positives; Approve/Reject.
+  - Annotate button opens the same modal with stitched context (0/1/2).
 
 ---
 
@@ -168,8 +181,8 @@ curl localhost:5000/areas/<AREA_ID>/scan/status
   - Cancellation endpoints; job persistence across app restart.
 
 - Dataset/Model
-  - Bounding-box annotation mode in the UI; export to YOLO/COCO.
-  - Train a fast detector for bounding boxes; integrate local inference.
+  - Exporters (YOLO/COCO) consuming oriented boxes (`cx,cy,w,h,angle_deg`) or `poly`.
+  - Keyboard shortcuts for annotator; optional canvas rotation; index for large `annotations.jsonl`.
 
 ---
 
