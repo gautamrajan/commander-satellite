@@ -141,6 +141,42 @@ def load_results_map():
 	return results_map
 
 
+def _build_coarse_negative_xy_from_file(coarse_log_path: str, zoom: int) -> set:
+    """Return a set of (x,y) tuples at a given zoom that were marked coarse-negative.
+
+    Reads coarse.jsonl where each line can include: {stage:"coarse", z, x, y, factor, positive:bool}.
+    For any record with positive == False, we mark all children (x..x+f-1, y..y+f-1) as coarse-negative.
+    """
+    neg: set = set()
+    try:
+        if not coarse_log_path or not os.path.exists(coarse_log_path):
+            return neg
+        with open(coarse_log_path, "r", encoding="utf-8", errors="ignore") as f:
+            for line in f:
+                try:
+                    obj = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if obj.get("stage") != "coarse":
+                    continue
+                z = obj.get("z")
+                if z != zoom:
+                    continue
+                if bool(obj.get("positive")):
+                    continue
+                x0 = obj.get("x")
+                y0 = obj.get("y")
+                factor = int(obj.get("factor") or 0)
+                if not isinstance(x0, int) or not isinstance(y0, int) or factor <= 0:
+                    continue
+                for yy in range(y0, y0 + factor):
+                    for xx in range(x0, x0 + factor):
+                        neg.add((xx, yy))
+    except Exception:
+        pass
+    return neg
+
+
 def load_results_map_for_area(area_id: str):
     """Read an AOI's all_results.jsonl into a path->metadata map."""
     p = area_paths(area_id)
@@ -368,6 +404,9 @@ def list_tiles_at_zoom(z: int):
 		}
 
 	results_map = load_results_map()
+	# derive coarse-negative set from global coarse.jsonl if present
+	global_coarse_log = "coarse.jsonl"
+	coarse_neg_xy = _build_coarse_negative_xy_from_file(global_coarse_log, z)
 	review_map = load_review_status_map()
 	tiles = []
 	min_x = None
@@ -398,6 +437,9 @@ def list_tiles_at_zoom(z: int):
 			review_status = review_map.get(rel_path, {})
 			positive = bool(meta.get("positive")) if meta else False
 			confidence = meta.get("confidence") if meta else None
+			# mark coarse-negative when no AI meta and present in coarse-neg set
+			is_meta = confidence is not None
+			is_coarse_neg = (not is_meta) and ((x_val, y_val) in coarse_neg_xy)
 			tiles.append({
 				"z": z,
 				"x": x_val,
@@ -407,6 +449,7 @@ def list_tiles_at_zoom(z: int):
 				"confidence": confidence,
 				"reviewed": review_status.get("reviewed", False),
 				"approved": review_status.get("approved", None),
+				"coarse_negative": is_coarse_neg,
 				"image_url": f"/image/{rel_path.replace('\\', '/')}",
 			})
 			min_x = x_val if min_x is None else min(min_x, x_val)
@@ -442,6 +485,9 @@ def list_tiles_at_zoom_for_area(area_id: str, z: int):
 		}
 
 	results_map = load_results_map_for_area(area_id)
+	# Build coarse-negative set for this AOI
+	p = area_paths(area_id)
+	coarse_neg_xy = _build_coarse_negative_xy_from_file(p.get("coarse"), z)
 
 	# build review map
 	review_map = {}
@@ -485,6 +531,8 @@ def list_tiles_at_zoom_for_area(area_id: str, z: int):
 			rmeta = review_map.get(rel_path, {})
 			positive = bool(meta.get("positive")) if meta else False
 			confidence = meta.get("confidence") if meta else None
+			is_meta = confidence is not None
+			is_coarse_neg = (not is_meta) and ((x_val, y_val) in coarse_neg_xy)
 			tiles.append({
 				"z": z,
 				"x": x_val,
@@ -494,6 +542,7 @@ def list_tiles_at_zoom_for_area(area_id: str, z: int):
 				"confidence": confidence,
 				"reviewed": rmeta.get("reviewed", False),
 				"approved": rmeta.get("approved", None),
+				"coarse_negative": is_coarse_neg,
 				"image_url": f"/areas/{area_id}/image/{rel_path.replace('\\', '/')}",
 			})
 			min_x = x_val if min_x is None else min(min_x, x_val)
@@ -711,6 +760,7 @@ def area_scan_start(area_id: str):
     coarse_threshold = float(payload.get("coarse_threshold") or 0.3)
     limit = payload.get("limit")
     limit = int(limit) if (limit is not None and str(limit).strip() != "") else None
+    concurrency = int(payload.get("concurrency") or 1)
 
     cmd = [
         sys.executable, "scan_dumpsters.py",
@@ -722,6 +772,8 @@ def area_scan_start(area_id: str):
         "--min_confidence", str(min_conf),
         "--resume",
     ]
+    if concurrency and concurrency > 1:
+        cmd += ["--concurrency", str(concurrency)]
     if context_radius and context_radius > 0:
         cmd += ["--context_radius", str(context_radius)]
     if coarse_factor and coarse_factor > 1:
@@ -874,6 +926,7 @@ def scan_start():
     coarse_threshold = float(payload.get("coarse_threshold") or 0.3)
     limit = payload.get("limit")
     limit = int(limit) if (limit is not None and str(limit).strip() != "") else None
+    concurrency = int(payload.get("concurrency") or 1)
 
     # Decide output files: area-scoped if area_id provided, else global
     if area_id:
@@ -905,6 +958,8 @@ def scan_start():
         "--min_confidence", str(min_conf),
         "--resume",
     ]
+    if concurrency and concurrency > 1:
+        cmd += ["--concurrency", str(concurrency)]
     if context_radius and context_radius > 0:
         cmd += ["--context_radius", str(context_radius)]
     if coarse_factor and coarse_factor > 1:
@@ -1046,6 +1101,8 @@ def scan_status():
         percent = None
         if expected_total and expected_total > 0:
             percent = max(0, min(100, int(100 * processed / expected_total)))
+        if (not running) and expected_total and expected_total > 0:
+            percent = 100
         
         progress = {
             "running": running,
@@ -1073,6 +1130,41 @@ def scan_logs():
         "stdout": tail_lines(stdout_log, max_lines) if stdout_log else "",
         "stderr": tail_lines(stderr_log, max_lines) if stderr_log else "",
     })
+
+
+@app.route("/scan/clear", methods=["POST"])
+def scan_clear_global():
+    """Clear global scan artifacts (all_results.jsonl, dumpsters.jsonl, coarse.jsonl)."""
+    cleared = []
+    errors = []
+    files = [ALL_RESULTS_FILE, "dumpsters.jsonl", "coarse.jsonl"]
+    for f in files:
+        try:
+            if os.path.exists(f):
+                os.remove(f)
+                cleared.append(f)
+        except Exception as e:
+            errors.append({"file": f, "error": str(e)})
+    return jsonify({"status": "ok", "cleared": cleared, "errors": errors})
+
+
+@app.route("/areas/<area_id>/scan/clear", methods=["POST"])
+def scan_clear_area(area_id: str):
+    """Clear scan artifacts for an area: all_results.jsonl, dumpsters.jsonl, coarse.jsonl, reviewed_results.jsonl."""
+    p = area_paths(area_id)
+    if not os.path.isdir(p["base"]):
+        return jsonify({"error": "area not found"}), 404
+    cleared = []
+    errors = []
+    files = [p["all_results"], p["dumpsters"], p["coarse"], p["reviewed"]]
+    for f in files:
+        try:
+            if f and os.path.exists(f):
+                os.remove(f)
+                cleared.append(f)
+        except Exception as e:
+            errors.append({"file": f, "error": str(e)})
+    return jsonify({"status": "ok", "area_id": area_id, "cleared": cleared, "errors": errors})
 
 
 @app.route("/image/<path:image_path>")

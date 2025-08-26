@@ -119,6 +119,7 @@
                         <div class="item"><span class="swatch positive"></span><span>AI Positive (unreviewed)</span></div>
                         <div class="item"><span class="swatch negative"></span><span>AI Negative (unreviewed)</span></div>
                         <div class="item"><span class="swatch unknown"></span><span>No AI metadata</span></div>
+                        <div class="item"><span class="swatch coarse-neg"></span><span>Coarse Negative (not refined)</span></div>
                         <div class="item"><span class="swatch rev-app"></span><span>Reviewed Approved</span></div>
                         <div class="item"><span class="swatch rev-rej"></span><span>Reviewed Rejected</span></div>
                     </div>
@@ -199,6 +200,10 @@
                     <input id="scan-rpm" type="number" value="60">
                 </div>
                 <div class="row">
+                    <label>Concurrency</label>
+                    <input id="scan-concurrency" type="number" value="1" min="1" max="32">
+                </div>
+                <div class="row">
                     <label>Min confidence</label>
                     <input id="scan-min-conf" type="number" step="0.01" value="0.5">
                 </div>
@@ -228,6 +233,7 @@
                 <div class="actions">
                     <button id="scan-start">Start Scan</button>
                     <button id="scan-stop" disabled>Stop Scan</button>
+                    <button id="scan-clear" class="danger">Clear Scan Data</button>
                 </div>
             </div>
             <div class="scan-status">
@@ -606,8 +612,13 @@
                         displayConfidence = fmtConfidence(t.confidence);
                     } else {
                         const hasMeta = t.confidence !== null && t.confidence !== undefined;
-                        statusClass = !hasMeta ? 'unknown' : (t.positive ? 'positive' : 'negative');
-                        statusText = !hasMeta ? 'Unknown' : (t.positive ? 'AI Positive' : 'AI Negative');
+                        if (!hasMeta && t.coarse_negative) {
+                            statusClass = 'coarse-neg';
+                            statusText = 'Coarse Negative';
+                        } else {
+                            statusClass = !hasMeta ? 'unknown' : (t.positive ? 'positive' : 'negative');
+                            statusText = !hasMeta ? 'Unknown' : (t.positive ? 'AI Positive' : 'AI Negative');
+                        }
                         displayConfidence = fmtConfidence(t.confidence);
                     }
                     
@@ -838,10 +849,12 @@
             // Scan tab logic
             const btnStart = document.getElementById('scan-start');
             const btnStop = document.getElementById('scan-stop');
+            const btnClear = document.getElementById('scan-clear');
             const requestEstimate = document.getElementById('scan-request-estimate');
             const tilesDirInput = document.getElementById('scan-tiles-dir');
             const modelInput = document.getElementById('scan-model');
             const rpmInput = document.getElementById('scan-rpm');
+            const concurrencyInput = document.getElementById('scan-concurrency');
             const minConfInput = document.getElementById('scan-min-conf');
             const ctxInput = document.getElementById('scan-context');
             const coarseFactorInput = document.getElementById('scan-coarse-factor');
@@ -941,6 +954,7 @@
                     tiles_dir: tilesDirInput.value || 'tiles',
                     model: modelInput.value || 'google/gemini-2.5-pro',
                     rpm: Number(rpmInput.value || 60),
+                    concurrency: Number(concurrencyInput.value || 1),
                     min_confidence: Number(minConfInput.value || 0.5),
                     context_radius: Number(ctxInput.value || 0),
                     coarse_factor: Number(coarseFactorInput.value || 0),
@@ -965,6 +979,23 @@
                         pollStatus();
                     }).catch(() => {});
                 }
+            });
+
+            btnClear.addEventListener('click', () => {
+                const areaId = scanAreaSelect.value;
+                const url = areaId ? `/areas/${areaId}/scan/clear` : '/scan/clear';
+                if (!confirm('Delete existing scan data (results, reviewed, coarse) for this scope?')) return;
+                fetch(url, { method: 'POST' })
+                  .then(r => r.json())
+                  .then(() => {
+                      // Refresh relevant UI state
+                      pollStatus();
+                      if (areaId) {
+                          // reload mosaic zooms/tiles next time user opens
+                          // no-op here; status will reflect cleared counts
+                      }
+                  })
+                  .catch(() => {});
             });
 
             // ===================== Annotation logic =====================
