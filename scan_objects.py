@@ -177,7 +177,7 @@ def build_langchain_llm(model: str, api_key: str) -> ChatOpenAI:
         model_kwargs={"response_format": {"type": "json_object"}},
         default_headers={
             "HTTP-Referer": "https://local.script",
-            "X-Title": "Dumpster scanner",
+            "X-Title": "Object detection scanner",
         },
     )
 

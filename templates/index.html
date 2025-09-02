@@ -4,7 +4,7 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Dumpster Detection Review</title>
+    <title>Object Detection Review</title>
     <link rel="stylesheet" href="/static/style.css">
     <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" integrity="sha256-p4NxAoJBhIIN+hmNHrzRCf9tD/miZyoHS5obTRR9BMY=" crossorigin=""/>
     <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css" crossorigin="anonymous"/>
@@ -12,7 +12,7 @@
 </head>
 <body>
     <div class="container">
-        <h1 style="text-align:left;margin:0 0 10px;">Dumpster Detection Review</h1>
+        <h1 style="text-align:left;margin:0 0 10px;">Object Detection Review</h1>
 
         <div class="tabs">
             <button class="tab-button active" data-tab="tab-areas">Areas</button>
@@ -159,7 +159,7 @@
                         </select>
                         <span class="sep"></span>
                         <label>Label</label>
-                        <input id="ann-label" type="text" value="dumpster" placeholder="label for new box" />
+                        <input id="ann-label" type="text" value="object" placeholder="label for new box" />
                         <span class="hint">Click and drag on the canvas to add a box. Click a box in the list to select. Delete to remove.</span>
                     </div>
                     <div class="right">
@@ -185,6 +185,13 @@
                     <label>Area</label>
                     <select id="scan-area-select">
                         <option value="">Global (tiles/)</option>
+                    </select>
+                </div>
+                <div class="row">
+                    <label>Detection Type</label>
+                    <select id="scan-detection-type">
+                        <option value="dumpsters">Dumpster Detection</option>
+                        <option value="construction">Construction Site Detection</option>
                     </select>
                 </div>
                 <div class="row">
@@ -412,7 +419,10 @@
                             if (action === 'fetch') {
                                 fetch(`/areas/${id}/fetch/start`, {method: 'POST'}).then(() => {});
                             } else if (action === 'scan') {
-                                fetch(`/areas/${id}/scan/start`, {method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify({})}).then(() => {});
+                                const payload = {
+                                    detection_type: detectionTypeSelect.value || 'dumpsters'
+                                };
+                                fetch(`/areas/${id}/scan/start`, {method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify(payload)}).then(() => {});
                             } else if (action === 'review') {
                                 areaSelectReview.value = id; tabButtons[1].click(); // Review tab
                                 loadDetectionsForArea();
@@ -851,6 +861,7 @@
             const btnStop = document.getElementById('scan-stop');
             const btnClear = document.getElementById('scan-clear');
             const requestEstimate = document.getElementById('scan-request-estimate');
+            const detectionTypeSelect = document.getElementById('scan-detection-type');
             const tilesDirInput = document.getElementById('scan-tiles-dir');
             const modelInput = document.getElementById('scan-model');
             const rpmInput = document.getElementById('scan-rpm');
@@ -911,6 +922,28 @@
                 input.addEventListener('input', updateRequestEstimate);
             });
 
+            // Load detection types and populate dropdown
+            fetch('/detection_types')
+                .then(r => r.json())
+                .then(types => {
+                    detectionTypeSelect.innerHTML = '';
+                    for (const type of types) {
+                        const option = document.createElement('option');
+                        option.value = type.id;
+                        option.textContent = type.name;
+                        if (type.id === 'dumpsters') option.selected = true; // Default selection
+                        detectionTypeSelect.appendChild(option);
+                    }
+                })
+                .catch(err => {
+                    console.error('Failed to load detection types:', err);
+                    // Fallback to hardcoded options if API fails
+                    detectionTypeSelect.innerHTML = `
+                        <option value="dumpsters" selected>Dumpster Detection</option>
+                        <option value="construction">Construction Site Detection</option>
+                    `;
+                });
+
             // Initial estimate
             updateRequestEstimate();
 
@@ -951,6 +984,7 @@
             btnStart.addEventListener('click', () => {
                 const payload = {
                     area_id: scanAreaSelect.value || null,
+                    detection_type: detectionTypeSelect.value || 'dumpsters',
                     tiles_dir: tilesDirInput.value || 'tiles',
                     model: modelInput.value || 'google/gemini-2.5-pro',
                     rpm: Number(rpmInput.value || 60),

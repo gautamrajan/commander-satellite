@@ -8,6 +8,9 @@ import shutil
 from datetime import datetime
 from flask import Flask, jsonify, render_template, request, send_from_directory
 
+# Import detection type configuration
+from detection_types import get_available_detection_types, get_detection_type, get_output_filename
+
 app = Flask(__name__)
 
 TILES_DIR = os.path.abspath("tiles")
@@ -369,6 +372,22 @@ def _estimate_fetch_target(area_sqmi: float, zoom: int) -> int:
 @app.route("/")
 def index():
     return render_template("index.html")
+
+
+@app.route("/detection_types")
+def get_detection_types():
+    """Return available detection types for UI selection."""
+    types = []
+    for type_id in get_available_detection_types():
+        config = get_detection_type(type_id)
+        types.append({
+            "id": config.id,
+            "name": config.name,
+            "description": config.description,
+            "color": config.ui_color,
+            "icon": config.icon
+        })
+    return jsonify(types)
 
 
 @app.route("/detections")
@@ -751,22 +770,32 @@ def area_scan_start(area_id: str):
     if not os.path.isdir(p["tiles"]):
         return jsonify({"error": "tiles not found for area"}), 404
 
+    detection_type = payload.get("detection_type") or "dumpsters"
+    try:
+        config = get_detection_type(detection_type)
+    except ValueError as e:
+        return jsonify({"error": str(e)}), 400
+    
     model = payload.get("model") or "google/gemini-2.5-pro"
     rpm = float(payload.get("rpm") or 60)
-    min_conf = float(payload.get("min_confidence") or 0.5)
+    min_conf = float(payload.get("min_confidence") or config.confidence_threshold)
     context_radius = int(payload.get("context_radius") or 0)
     coarse_factor = int(payload.get("coarse_factor") or 0)
     coarse_downscale = int(payload.get("coarse_downscale") or 256)
-    coarse_threshold = float(payload.get("coarse_threshold") or 0.3)
+    coarse_threshold = float(payload.get("coarse_threshold") or config.coarse_threshold)
     limit = payload.get("limit")
     limit = int(limit) if (limit is not None and str(limit).strip() != "") else None
     concurrency = int(payload.get("concurrency") or 1)
 
+    # Use detection-type-specific output file
+    out_file = os.path.join(p["base"], get_output_filename(detection_type))
+
     cmd = [
-        sys.executable, "scan_dumpsters.py",
+        sys.executable, "scan_objects.py",
         "--tiles_dir", p["tiles"],
-        "--out", p["dumpsters"],
+        "--out", out_file,
         "--log_all", p["all_results"],
+        "--detection_type", detection_type,
         "--rpm", str(rpm),
         "--model", model,
         "--min_confidence", str(min_conf),
@@ -917,13 +946,20 @@ def scan_start():
     payload = request.get_json(force=True) or {}
     area_id = payload.get("area_id") or None
     tiles_dir = os.path.abspath(payload.get("tiles_dir") or TILES_DIR)
+    detection_type = payload.get("detection_type") or "dumpsters"
+    
+    try:
+        config = get_detection_type(detection_type)
+    except ValueError as e:
+        return jsonify({"error": str(e)}), 400
+    
     model = payload.get("model") or "google/gemini-2.5-pro"
     rpm = float(payload.get("rpm") or 60)
-    min_conf = float(payload.get("min_confidence") or 0.5)
+    min_conf = float(payload.get("min_confidence") or config.confidence_threshold)
     context_radius = int(payload.get("context_radius") or 0)
     coarse_factor = int(payload.get("coarse_factor") or 0)
     coarse_downscale = int(payload.get("coarse_downscale") or 256)
-    coarse_threshold = float(payload.get("coarse_threshold") or 0.3)
+    coarse_threshold = float(payload.get("coarse_threshold") or config.coarse_threshold)
     limit = payload.get("limit")
     limit = int(limit) if (limit is not None and str(limit).strip() != "") else None
     concurrency = int(payload.get("concurrency") or 1)
@@ -934,14 +970,14 @@ def scan_start():
         os.makedirs(p["base"], exist_ok=True)
         os.makedirs(p["logs"], exist_ok=True)
         all_results = p["all_results"]
-        out_file = p["dumpsters"]
+        out_file = os.path.join(p["base"], get_output_filename(detection_type))
         coarse_log = p["coarse"] if (coarse_factor and coarse_factor > 1) else None
         stdout_log = p["scan_stdout"]
         stderr_log = p["scan_stderr"]
     else:
         # Output files (fixed names in cwd)
         all_results = ALL_RESULTS_FILE
-        out_file = "dumpsters.jsonl"
+        out_file = get_output_filename(detection_type)
         coarse_log = "coarse.jsonl" if coarse_factor and coarse_factor > 1 else None
         ts = datetime.utcnow().strftime("%Y%m%dT%H%M%SZ")
         stdout_log = f"scan_{ts}.out.log"
@@ -949,10 +985,11 @@ def scan_start():
 
     cmd = [
         sys.executable,
-        "scan_dumpsters.py",
+        "scan_objects.py",
         "--tiles_dir", tiles_dir,
         "--out", out_file,
         "--log_all", all_results,
+        "--detection_type", detection_type,
         "--rpm", str(rpm),
         "--model", model,
         "--min_confidence", str(min_conf),
@@ -1134,11 +1171,25 @@ def scan_logs():
 
 @app.route("/scan/clear", methods=["POST"])
 def scan_clear_global():
-    """Clear global scan artifacts (all_results.jsonl, dumpsters.jsonl, coarse.jsonl)."""
+    """Clear global scan artifacts across all detection types.
+
+    Removes:
+    - all_results.jsonl (resume log)
+    - coarse.jsonl (coarse stage log)
+    - positives-only files for all detection types (e.g., dumpsters.jsonl, construction_sites.jsonl)
+    """
     cleared = []
     errors = []
-    files = [ALL_RESULTS_FILE, "dumpsters.jsonl", "coarse.jsonl"]
-    for f in files:
+    # Start with shared logs
+    files_set = {ALL_RESULTS_FILE, "coarse.jsonl"}
+    # Add positives-only outputs for all detection types
+    try:
+        for t in get_available_detection_types():
+            files_set.add(get_output_filename(t))
+    except Exception:
+        # Fallback: ensure at least dumpsters.jsonl is included
+        files_set.add("dumpsters.jsonl")
+    for f in sorted(files_set):
         try:
             if os.path.exists(f):
                 os.remove(f)
@@ -1150,16 +1201,28 @@ def scan_clear_global():
 
 @app.route("/areas/<area_id>/scan/clear", methods=["POST"])
 def scan_clear_area(area_id: str):
-    """Clear scan artifacts for an area: all_results.jsonl, dumpsters.jsonl, coarse.jsonl, reviewed_results.jsonl."""
+    """Clear scan artifacts for an area across all detection types.
+
+    Removes area-scoped:
+    - all_results.jsonl, coarse.jsonl, reviewed_results.jsonl
+    - positives-only files for all detection types under the area base dir
+    """
     p = area_paths(area_id)
     if not os.path.isdir(p["base"]):
         return jsonify({"error": "area not found"}), 404
     cleared = []
     errors = []
-    files = [p["all_results"], p["dumpsters"], p["coarse"], p["reviewed"]]
-    for f in files:
+    files_set = {p["all_results"], p["coarse"], p["reviewed"], p.get("dumpsters")}
+    # Add detection-type-specific positives files
+    try:
+        for t in get_available_detection_types():
+            files_set.add(os.path.join(p["base"], get_output_filename(t)))
+    except Exception:
+        # Fallback to dumpsters file path already included
+        pass
+    for f in sorted({f for f in files_set if f}):
         try:
-            if f and os.path.exists(f):
+            if os.path.exists(f):
                 os.remove(f)
                 cleared.append(f)
         except Exception as e:
@@ -1279,4 +1342,4 @@ def annotations_post_area(area_id: str):
 
 
 if __name__ == "__main__":
-    app.run(debug=True)
+    app.run(debug=True, port=5001)
