@@ -7,6 +7,7 @@ import subprocess
 import shutil
 from datetime import datetime
 from flask import Flask, jsonify, render_template, request, send_from_directory
+import math
 from typing import List, Tuple
 
 # Optional KML helpers
@@ -269,6 +270,93 @@ SCAN_STATE = {
     },
 }
 SCAN_LOCK = threading.Lock()
+GEOCODE_LOCK = threading.Lock()
+
+# ---- Geocode helpers (tile math + providers) ----
+def _tile_to_latlon(x: int, y: int, z: int) -> tuple:
+    n = 2.0 ** z
+    lon = x / n * 360.0 - 180.0
+    lat = math.degrees(math.atan(math.sinh(math.pi * (1 - 2*y/n))))
+    return lat, lon
+
+
+def _tile_center_latlon(z: int, x: int, y: int) -> tuple:
+    lat0, lon0 = _tile_to_latlon(x, y, z)
+    lat1, lon1 = _tile_to_latlon(x + 1, y + 1, z)
+    return (lat0 + lat1) / 2.0, (lon0 + lon1) / 2.0
+
+
+def _pixel_to_latlon(z: int, x: int, y: int, px: int, py: int) -> tuple:
+    """Convert a pixel within a z/x/y tile (px,py in [0,255]) to lat/lon."""
+    # Clamp px/py
+    px = max(0, min(int(px), 255))
+    py = max(0, min(int(py), 255))
+    n = 2 ** int(z)
+    map_size = 256 * n
+    gx = int(x) * 256 + px
+    gy = int(y) * 256 + py
+    lon = gx / map_size * 360.0 - 180.0
+    lat = math.degrees(math.atan(math.sinh(math.pi * (1 - 2 * (gy / map_size)))))
+    return (lat, lon)
+
+
+def _geocode_cache_path(area_id: str = None) -> str:
+    if area_id:
+        return os.path.join(area_paths(area_id)["base"], "geocode_cache.json")
+    return os.path.abspath("geocode_cache.json")
+
+
+def _geocode_provider_arcgis(lat: float, lon: float, timeout: float = 10.0):
+    from urllib.request import urlopen, Request
+    from urllib.parse import urlencode
+    base = "https://geocode.arcgis.com/arcgis/rest/services/World/GeocodeServer/reverseGeocode"
+    qs = urlencode({"f": "pjson", "location": f"{lon},{lat}", "outSR": 4326, "langCode": "en"})
+    url = f"{base}?{qs}"
+    req = Request(url, headers={"User-Agent": "sat-data-fetcher/1.0"})
+    with urlopen(req, timeout=timeout) as r:
+        data = json.loads(r.read().decode("utf-8", errors="ignore"))
+    try:
+        return (data.get("address") or {}).get("Match_addr")
+    except Exception:
+        return None
+
+
+def _geocode_provider_nominatim(lat: float, lon: float, timeout: float = 10.0):
+    from urllib.request import urlopen, Request
+    from urllib.parse import urlencode
+    base = "https://nominatim.openstreetmap.org/reverse"
+    qs = urlencode({"format": "jsonv2", "lat": lat, "lon": lon, "zoom": 18, "addressdetails": 1})
+    url = f"{base}?{qs}"
+    req = Request(url, headers={"User-Agent": "sat-data-fetcher/1.0 (dashboard)"})
+    with urlopen(req, timeout=timeout) as r:
+        data = json.loads(r.read().decode("utf-8", errors="ignore"))
+    return data.get("display_name")
+
+
+def _geocode_provider_google(lat: float, lon: float, api_key: str, timeout: float = 10.0):
+    from urllib.request import urlopen, Request
+    from urllib.parse import urlencode
+    base = "https://maps.googleapis.com/maps/api/geocode/json"
+    qs = urlencode({"latlng": f"{lat},{lon}", "key": api_key})
+    url = f"{base}?{qs}"
+    req = Request(url, headers={"User-Agent": "sat-data-fetcher/1.0"})
+    with urlopen(req, timeout=timeout) as r:
+        data = json.loads(r.read().decode("utf-8", errors="ignore"))
+    if data.get("status") == "OK" and data.get("results"):
+        return data["results"][0].get("formatted_address")
+    return None
+
+
+def _geocode_provider_mapbox(lat: float, lon: float, token: str, timeout: float = 10.0):
+    from urllib.request import urlopen, Request
+    url = f"https://api.mapbox.com/geocoding/v5/mapbox.places/{lon},{lat}.json?language=en&access_token={token}"
+    req = Request(url, headers={"User-Agent": "sat-data-fetcher/1.0"})
+    with urlopen(req, timeout=timeout) as r:
+        data = json.loads(r.read().decode("utf-8", errors="ignore"))
+    feats = data.get("features") or []
+    if feats:
+        return feats[0].get("place_name")
+    return None
 
 
 def safe_count_lines(path: str) -> int:
@@ -1294,6 +1382,98 @@ def scan_logs():
         "stdout": tail_lines(stdout_log, max_lines) if stdout_log else "",
         "stderr": tail_lines(stderr_log, max_lines) if stderr_log else "",
     })
+
+
+@app.route("/geocode", methods=["POST"])
+def geocode_lookup():
+    """Reverse-geocode a lat/lon (or z/x/y) and return an address.
+
+    JSON body accepts: { lat, lon } OR { z, x, y }, optional { area_id, provider }.
+    Provider: arcgis (default), nominatim, google, mapbox.
+    Caches results in geocode_cache.json (global) or runs/<area>/geocode_cache.json.
+    """
+    payload = request.get_json(force=True) or {}
+    area_id = payload.get("area_id") or None
+    provider = (payload.get("provider") or "arcgis").lower()
+
+    lat = payload.get("lat")
+    lon = payload.get("lon")
+    z = payload.get("z")
+    x = payload.get("x")
+    y = payload.get("y")
+    px = payload.get("px")
+    py = payload.get("py")
+
+    if (lat is None or lon is None):
+        try:
+            zi = int(z) if z is not None else None
+            xi = int(x) if x is not None else None
+            yi = int(y) if y is not None else None
+        except Exception:
+            zi = xi = yi = None
+        if None not in (zi, xi, yi):
+            try:
+                # Clamp within valid range
+                n = 2 ** zi
+                xi = max(0, min(xi, n - 1))
+                yi = max(0, min(yi, n - 1))
+            except Exception:
+                pass
+            try:
+                if px is not None and py is not None:
+                    lat, lon = _pixel_to_latlon(zi, xi, yi, int(px), int(py))
+                else:
+                    lat, lon = _tile_center_latlon(zi, xi, yi)
+            except Exception:
+                lat, lon = None, None
+    if lat is None or lon is None:
+        return jsonify({"error": "lat/lon or z/x/y required"}), 400
+
+    cache_path = _geocode_cache_path(area_id)
+    # Cache key: if px/py used or lat/lon explicitly given, prefer precise lat/lon key
+    precise = (px is not None and py is not None) or (payload.get("lat") is not None and payload.get("lon") is not None)
+    if precise:
+        key = f"{round(float(lat), 6)},{round(float(lon), 6)}"
+    elif None not in (z, x, y):
+        key = f"{int(z)}/{int(x)}/{int(y)}"
+    else:
+        key = f"{round(float(lat), 6)},{round(float(lon), 6)}"
+
+    # Load cache
+    with GEOCODE_LOCK:
+        cache = _safe_read_json(cache_path, {})
+        if key in cache and isinstance(cache[key], str) and cache[key].strip():
+            return jsonify({"address": cache[key], "cached": True})
+
+    # Dispatch provider
+    try:
+        if provider == "arcgis":
+            addr = _geocode_provider_arcgis(float(lat), float(lon))
+        elif provider == "nominatim":
+            addr = _geocode_provider_nominatim(float(lat), float(lon))
+        elif provider == "google":
+            api_key = os.environ.get("GOOGLE_MAPS_API_KEY")
+            if not api_key:
+                return jsonify({"error": "GOOGLE_MAPS_API_KEY not set"}), 400
+            addr = _geocode_provider_google(float(lat), float(lon), api_key)
+        elif provider == "mapbox":
+            token = os.environ.get("MAPBOX_ACCESS_TOKEN")
+            if not token:
+                return jsonify({"error": "MAPBOX_ACCESS_TOKEN not set"}), 400
+            addr = _geocode_provider_mapbox(float(lat), float(lon), token)
+        else:
+            return jsonify({"error": f"unknown provider: {provider}"}), 400
+    except Exception as e:
+        return jsonify({"error": f"geocode failed: {e}"}), 502
+
+    if addr:
+        with GEOCODE_LOCK:
+            cache = _safe_read_json(cache_path, {})
+            cache[key] = addr
+            _safe_write_json(cache_path, cache)
+        return jsonify({"address": addr, "cached": False})
+    else:
+        return jsonify({"address": None, "cached": False})
 
 
 @app.route("/scan/clear", methods=["POST"])

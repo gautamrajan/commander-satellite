@@ -107,6 +107,22 @@ def load_processed_paths(*jsonl_paths: str) -> set:
     return processed
 
 
+# -------- tile math (Web Mercator) --------
+def _tile_to_latlon(x: int, y: int, z: int) -> Tuple[float, float]:
+    n = 2.0 ** z
+    lon = x / n * 360.0 - 180.0
+    lat = math.degrees(math.atan(math.sinh(math.pi * (1 - 2*y/n))))
+    return lat, lon
+
+
+def tile_center_latlon(z: Optional[int], x: Optional[int], y: Optional[int]) -> Tuple[Optional[float], Optional[float]]:
+    if z is None or x is None or y is None:
+        return None, None
+    lat0, lon0 = _tile_to_latlon(x, y, z)
+    lat1, lon1 = _tile_to_latlon(x + 1, y + 1, z)
+    return (lat0 + lat1) / 2.0, (lon0 + lon1) / 2.0
+
+
 def ensure_rate(rpm: float, last_call_time: Optional[float]) -> float:
     if rpm <= 0:
         return time.time()
@@ -471,16 +487,22 @@ def main() -> None:
                 to_write["positive"] = is_positive
                 to_write["confidence"] = confidence_val
                 write_jsonl(log_all_fp, to_write)
-            if is_positive:
-                out_line = {
-                    "path": record_all["path"],
-                    "z": record_all.get("z"),
-                    "x": record_all.get("x"),
-                    "y": record_all.get("y"),
-                    "confidence": confidence_val,
-                    "model": args.model,
-                }
-                write_jsonl(out_fp, out_line)
+                if is_positive:
+                    out_line = {
+                        "path": record_all["path"],
+                        "z": record_all.get("z"),
+                        "x": record_all.get("x"),
+                        "y": record_all.get("y"),
+                        "lat": None,
+                        "lon": None,
+                        "confidence": confidence_val,
+                        "model": args.model,
+                    }
+                    lat_c, lon_c = tile_center_latlon(out_line["z"], out_line["x"], out_line["y"])
+                    if lat_c is not None and lon_c is not None:
+                        out_line["lat"] = lat_c
+                        out_line["lon"] = lon_c
+                    write_jsonl(out_fp, out_line)
 
         def build_context_if_needed(z, x, y):
             if z is None or x is None or y is None or not args.context_radius or args.context_radius <= 0:
@@ -1029,5 +1051,4 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-
 

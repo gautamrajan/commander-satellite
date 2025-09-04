@@ -7,17 +7,25 @@ This document orients AI agents picking up development. It summarizes architectu
 ### 1) Project Overview
 
 - **Scripts**
-  - `grab_imagery.py`: Fetches Esri World Imagery tiles for a bbox, writes `mosaic.tif`/`mosaic_preview.png`, and optionally persists a Z/X/Y tile tree.
-  - `scan_dumpsters.py`: Iterates tiles and calls OpenRouter (LangChain) to classify dumpsters; writes `dumpsters.jsonl` (positives) and `all_results.jsonl` (all outcomes).
+  - `grab_imagery.py`: Fetches Esri World Imagery tiles for a bbox or polygon geometry.
+    - BBox mode (point + area): writes `mosaic.tif`/`mosaic_preview.png` and optionally persists `tiles/z/x/y.jpg`.
+    - Geometry mode: accepts `--geometry_json` or `--kml` and fetches only tiles whose centers fall inside the polygon(s). Use `--no_mosaic` to skip GeoTIFF/PNG for large AOIs.
+  - `scan_dumpsters.py` / `scan_objects.py`: Iterate tiles and call OpenRouter (LangChain) for detections. Writes `all_results.jsonl` (all outcomes) and detection-type positives (e.g., `dumpsters.jsonl`).
   - `review_app.py` (Flask): Web dashboard for scanning orchestration, AOI (Area of Interest) management, mosaic visualization, and human review.
+    - Supports KML area import and address lookup (reverse geocoding) per tile, including precise click-to-pick inside a tile.
 
 - **AOI (Area) model**
   - Each area lives under `runs/<area_id>/` with:
     - `area.json`, `tiles/`, `all_results.jsonl`, `dumpsters.jsonl`, `reviewed_results.jsonl`, `coarse.jsonl`, `logs/`, `mosaic.tif`, `mosaic_preview.png`.
   - Global legacy mode still supported: `tiles/`, `all_results.jsonl`, `reviewed_results.jsonl` in repo root.
+  - Imported KML is persisted as `runs/<area_id>/source.kml`; normalized polygons are stored in `area.json.geometry`.
 
 - **Key env**
   - `OPENROUTER_API_KEY` must be set to scan. If credits are insufficient, OpenRouter returns HTTP 402 (you’ll see this in logs).
+  - Geocoding (optional):
+    - No key needed for ArcGIS/Nominatim (use modest rates and descriptive UA).
+    - `GOOGLE_MAPS_API_KEY` for Google Geocoding.
+    - `MAPBOX_ACCESS_TOKEN` for Mapbox Geocoding.
 
 ---
 
@@ -27,7 +35,8 @@ This document orients AI agents picking up development. It summarizes architectu
   - `{ "path":"z/x/y.jpg", "z":int, "x":int, "y":int, "model":str, "result_raw":{...}, "positive":bool, "confidence":float, ... }`
 
 - `dumpsters.jsonl` (positives only)
-  - `{ "path":"z/x/y.jpg", "z":int, "x":int, "y":int, "confidence":float, "model":str }`
+  - `{ "path":"z/x/y.jpg", "z":int, "x":int, "y":int, "lat"?:float, "lon"?:float, "confidence":float, "model":str }`
+  - Notes: `lat`/`lon` (tile-center) are included for new scans; older files may omit and can be backfilled.
 
 - `reviewed_results.jsonl` (human review)
   - `{ "path":"z/x/y.jpg", "approved":bool }`
@@ -52,19 +61,23 @@ Global (legacy) endpoints:
 - `GET /scan/status` – running + counts delta since start
 - `GET /scan/logs?n=200` – stdout/stderr tail
 - `GET /mosaic/zooms` / `GET /mosaic/tiles/{z}` / `GET /image/{path}`
-- `GET /detections` – positives minus reviewed (legacy)
-- `POST /review` / `POST /review/toggle`
+ - `GET /detections` – positives minus reviewed (legacy)
+ - `POST /review` / `POST /review/toggle`
  - `GET /annotations?path=z/x/y.jpg` – latest annotations for a tile
  - `POST /annotations` – append a snapshot
+  - `POST /geocode` – reverse geocode `{ lat, lon }` or `{ z, x, y }` and optional `{ px, py }` (pixel inside tile) to improve accuracy. Returns `{ address, cached }`. Include `area_id` to scope the cache to an AOI.
 
 Area-scoped endpoints (preferred):
 - Areas
   - `GET /areas` – list AOIs
   - `POST /areas` – create AOI `{ name, center:{lat,lon}, area_sqmi, zoom? }`
+  - `POST /areas/import_kml` – multipart upload: field `kml` + optional `name`, `zoom`. Creates AOI with `geometry` (list of [lat,lon] pairs per polygon).
   - `GET /areas/{area_id}` – AOI detail
 
 - Fetch imagery (AOI)
   - `POST /areas/{area_id}/fetch/start` – runs `grab_imagery.py`
+    - If AOI has `geometry`, writes a `geometry.json` and invokes `grab_imagery.py --geometry_json ... --no_mosaic --save_tiles_dir runs/<area_id>/tiles`.
+    - Else uses bbox mode with `--lat/--lon/--area_sqmi` (+ `--auto_zoom` or `--zoom`).
   - `GET  /areas/{area_id}/fetch/status` – returns `{ running, pid, zooms, progress:{ fetched, target, percent }, stdout, stderr }`
   - Progress is computed by counting saved tiles and parsing `Tiles: … = N tiles` from `fetch.out.log`.
 
@@ -84,6 +97,7 @@ Area-scoped endpoints (preferred):
   - `POST /areas/{area_id}/review/toggle` – `{ path }` (toggle or set with `approved`)
   - `GET /areas/{area_id}/annotations?path=z/x/y.jpg` – latest annotations
   - `POST /areas/{area_id}/annotations` – append snapshot `{ path, z, x, y, context_radius, canvas_size, boxes:[...] }`
+  - `POST /geocode` – same as global; include `area_id` to scope cache to AOI.
 
 ---
 
@@ -96,11 +110,15 @@ Area-scoped endpoints (preferred):
 - Mosaic tab
   - Area selector → Zoom selector → Filter (AI+, AI−, Reviewed Approved/Rejected, All).
   - Sidebar shows area summary counts, legend; click tiles to toggle review in-place.
+  - Selected tile panel:
+    - “Lookup Address” uses tile center.
+    - “Pick Address Point” enters a one-click mode (crosshair cursor + hint). Click on the image to geocode that exact point (marker shown), then mode exits automatically.
   - Annotate a selected tile: opens oriented-bbox modal (draw, move, rotate, resize, label; save to `annotations.jsonl`).
 
 - Review tab
   - Area selector; step through unreviewed positives; Approve/Reject.
   - Annotate button opens the same modal with stitched context (0/1/2).
+  - Address helpers: “Lookup” (tile center) and “Pick Address Point” (precise click-to-geocode on the large image).
 
 ---
 
@@ -134,6 +152,7 @@ Gotchas:
 ```bash
 python -m venv myenv && source myenv/bin/activate
 pip install -r requirements.txt  # if present; otherwise install imports seen in scripts
+pip install rasterio             # required for GeoTIFF/PNG mosaic outputs
 export OPENROUTER_API_KEY=...    # required for scanning
 
 # Start dashboard
@@ -152,9 +171,21 @@ curl -X POST localhost:5000/areas -H 'Content-Type: application/json' \
 curl -X POST localhost:5000/areas/<AREA_ID>/fetch/start
 curl -X POST localhost:5000/areas/<AREA_ID>/scan/start -H 'Content-Type: application/json' -d '{}'
 
+# Import a KML as a new area (multipart)
+curl -X POST localhost:5000/areas/import_kml \
+  -F 'kml=@/path/to/area.kml' -F 'name=My KML AOI' -F 'zoom=19'
+
 # Poll status
 curl localhost:5000/areas/<AREA_ID>/fetch/status
 curl localhost:5000/areas/<AREA_ID>/scan/status
+
+# Reverse geocode (tile center)
+curl -X POST localhost:5000/geocode -H 'Content-Type: application/json' \
+  -d '{"z":19, "x":89721, "y":209373}'
+
+# Reverse geocode (precise pixel inside tile)
+curl -X POST localhost:5000/geocode -H 'Content-Type: application/json' \
+  -d '{"z":19, "x":89721, "y":209373, "px":130, "py":192}'
 ```
 
 ---
@@ -192,5 +223,3 @@ curl localhost:5000/areas/<AREA_ID>/scan/status
 - Don’t block the Flask event loop with long jobs—use subprocess (already in place).
 - When adding fields to JSONL, do so backward-compatibly; UI tolerates missing fields.
 - For sizeable edits, update this primer with any new contracts or flows.
-
-

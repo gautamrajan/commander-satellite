@@ -51,18 +51,22 @@
                 <label for="area-select-review">Area:</label>
                 <select id="area-select-review"><option value="">Global</option></select>
             </div>
-            <div id="review-area">
+                <div id="review-area">
                 <div id="image-container">
                     <img id="detection-image" src="" alt="Detection Image">
                 </div>
                 <div id="info-container">
                     <p><strong>Confidence:</strong> <span id="confidence"></span></p>
                     <p><strong>Path:</strong> <span id="path"></span></p>
+                    <p><strong>Address:</strong> <span id="review-address">-</span>
+                       <button id="review-geocode-btn" style="margin-left:6px;">Lookup</button>
+                       <button id="review-geocode-pick" style="margin-left:6px;">Pick Address Point</button>
+                    </p>
                 </div>
-                <div id="button-container">
-                    <button id="reject-btn">Reject</button>
-                    <button id="approve-btn">Approve</button>
-                    <button id="annotate-btn">Annotate</button>
+                    <div id="button-container">
+                        <button id="reject-btn">Reject</button>
+                        <button id="approve-btn">Approve</button>
+                        <button id="annotate-btn">Annotate</button>
                 </div>
             </div>
             <div id="no-more-detections" style="display: none;">
@@ -109,11 +113,14 @@
                             <div><strong>AI:</strong> <span id="tile-detail-ai">-</span></div>
                             <div><strong>Confidence:</strong> <span id="tile-detail-conf">-</span></div>
                             <div><strong>Reviewed:</strong> <span id="tile-detail-review">-</span></div>
+                            <div><strong>Address:</strong> <span id="tile-detail-address">-</span></div>
                         </div>
                         <div class="tile-detail-actions">
                             <button id="tile-approve">Approve</button>
                             <button id="tile-reject">Reject</button>
                             <button id="tile-annotate">Annotate</button>
+                            <button id="tile-geocode">Lookup Address</button>
+                            <button id="tile-geocode-pick">Pick Address Point</button>
                         </div>
                     </div>
                     <h3>Legend</h3>
@@ -282,6 +289,11 @@
             const detectionImage = document.getElementById("detection-image");
             const confidenceSpan = document.getElementById("confidence");
             const pathSpan = document.getElementById("path");
+            const reviewAddrSpan = document.getElementById('review-address');
+            const reviewGeocodeBtn = document.getElementById('review-geocode-btn');
+            const reviewGeocodePickBtn = document.getElementById('review-geocode-pick');
+            const reviewImgContainer = document.getElementById('image-container');
+            let reviewPickActive = false;
             // Areas tab setup
             const areasListEl = document.getElementById('areas-list');
             const areasRefreshBtn = document.getElementById('areas-refresh');
@@ -526,6 +538,14 @@
                     detectionImage.src = imgUrl;
                     confidenceSpan.textContent = detection.confidence;
                     pathSpan.textContent = detection.path;
+                    if (reviewAddrSpan) reviewAddrSpan.textContent = '-';
+                    // Clear pick mode
+                    if (reviewImgContainer) {
+                        reviewImgContainer.classList.remove('pick-mode');
+                        [...reviewImgContainer.querySelectorAll('.pick-marker','.pick-hint')].forEach(n => n.remove());
+                        reviewPickActive = false;
+                        if (reviewGeocodePickBtn) reviewGeocodePickBtn.textContent = 'Pick Address Point';
+                    }
                     reviewArea.style.display = "block";
                     noMoreDetections.style.display = "none";
                 } else {
@@ -558,6 +578,63 @@
                 if (!d) return;
                 const areaId = areaSelectReview.value || '';
                 openAnnotationModal({ areaId, path: d.path, z: d.z, x: d.x, y: d.y });
+            });
+            if (reviewGeocodeBtn) reviewGeocodeBtn.addEventListener('click', () => {
+                const d = detections[currentIndex];
+                if (!d) return;
+                const areaId = areaSelectReview.value || null;
+                const payload = { z: d.z, x: d.x, y: d.y, area_id: areaId };
+                fetch('/geocode', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify(payload) })
+                    .then(r => r.json()).then(resp => {
+                        if (resp && typeof resp.address === 'string') {
+                            if (reviewAddrSpan) reviewAddrSpan.textContent = resp.address;
+                        } else {
+                            if (reviewAddrSpan) reviewAddrSpan.textContent = 'N/A';
+                        }
+                    }).catch(() => { if (reviewAddrSpan) reviewAddrSpan.textContent = 'Error'; });
+            });
+            function enableReviewPickMode(enable) {
+                if (!reviewImgContainer) return;
+                reviewPickActive = !!enable;
+                reviewImgContainer.classList.toggle('pick-mode', reviewPickActive);
+                [...reviewImgContainer.querySelectorAll('.pick-hint')].forEach(n => n.remove());
+                if (reviewPickActive) {
+                    const hint = document.createElement('div');
+                    hint.className = 'pick-hint';
+                    hint.textContent = 'Click a point to geocode';
+                    reviewImgContainer.appendChild(hint);
+                }
+                if (reviewGeocodePickBtn) reviewGeocodePickBtn.textContent = reviewPickActive ? 'Cancel Pick' : 'Pick Address Point';
+            }
+            if (reviewGeocodePickBtn) reviewGeocodePickBtn.addEventListener('click', () => {
+                enableReviewPickMode(!reviewPickActive);
+            });
+            if (reviewImgContainer) reviewImgContainer.addEventListener('click', (e) => {
+                if (!reviewPickActive) return;
+                const d = detections[currentIndex];
+                if (!d) return;
+                const rect = detectionImage.getBoundingClientRect();
+                const fx = Math.min(1, Math.max(0, (e.clientX - rect.left) / rect.width));
+                const fy = Math.min(1, Math.max(0, (e.clientY - rect.top) / rect.height));
+                const px = Math.round(fx * 256);
+                const py = Math.round(fy * 256);
+                [...reviewImgContainer.querySelectorAll('.pick-marker')].forEach(n => n.remove());
+                const m = document.createElement('div');
+                m.className = 'pick-marker';
+                m.style.left = `${fx * 100}%`;
+                m.style.top = `${fy * 100}%`;
+                reviewImgContainer.appendChild(m);
+                const areaId = areaSelectReview.value || null;
+                const payload = { z: d.z, x: d.x, y: d.y, px, py, area_id: areaId };
+                fetch('/geocode', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify(payload) })
+                    .then(r => r.json()).then(resp => {
+                        if (resp && typeof resp.address === 'string') {
+                            if (reviewAddrSpan) reviewAddrSpan.textContent = resp.address;
+                        } else {
+                            if (reviewAddrSpan) reviewAddrSpan.textContent = 'N/A';
+                        }
+                    }).catch(() => { if (reviewAddrSpan) reviewAddrSpan.textContent = 'Error'; })
+                    .finally(() => enableReviewPickMode(false));
             });
             areaSelectReview.addEventListener('change', loadDetectionsForArea);
             areaSelectMosaic.addEventListener('change', loadMosaicZoomsForArea);
@@ -691,6 +768,11 @@
             const tileApproveBtn = document.getElementById('tile-approve');
             const tileRejectBtn = document.getElementById('tile-reject');
             const tileAnnotateBtn = document.getElementById('tile-annotate');
+            const tileGeocodeBtn = document.getElementById('tile-geocode');
+            const tileGeocodePickBtn = document.getElementById('tile-geocode-pick');
+            const tileAddrEl = document.getElementById('tile-detail-address');
+            const tileImgWrap = document.getElementById('tile-detail-image-wrap');
+            let tilePickActive = false;
             let currentTileData = null;
 
             function showTileDetail(tileEl, t) {
@@ -702,6 +784,14 @@
                 if (tileAIEl) tileAIEl.textContent = (t.confidence === null || t.confidence === undefined) ? 'N/A' : (t.positive ? 'Positive' : 'Negative');
                 if (tileConfEl) tileConfEl.textContent = fmtConfidence(t.confidence);
                 if (tileRevEl) tileRevEl.textContent = t.reviewed ? (t.approved ? 'Approved' : 'Rejected') : 'No';
+                if (tileAddrEl) tileAddrEl.textContent = '-';
+                // Clear any prior marker/hint
+                if (tileImgWrap) {
+                    tileImgWrap.classList.remove('pick-mode');
+                    [...tileImgWrap.querySelectorAll('.pick-marker,.pick-hint')].forEach(n => n.remove());
+                    tilePickActive = false;
+                    if (tileGeocodePickBtn) tileGeocodePickBtn.textContent = 'Pick Address Point';
+                }
             }
 
             function postReviewForTile(approved) {
@@ -731,6 +821,61 @@
                     if (!isNaN(zParsed)) zVal = zParsed;
                 }
                 openAnnotationModal({ areaId, path: currentTileData.path, z: zVal, x: currentTileData.x, y: currentTileData.y });
+            });
+            if (tileGeocodeBtn) tileGeocodeBtn.addEventListener('click', () => {
+                if (!currentTileData) return;
+                const areaId = areaSelectMosaic.value || null;
+                const payload = { z: currentTileData.z, x: currentTileData.x, y: currentTileData.y, area_id: areaId };
+                fetch('/geocode', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify(payload) })
+                    .then(r => r.json()).then(resp => {
+                        if (resp && typeof resp.address === 'string') {
+                            if (tileAddrEl) tileAddrEl.textContent = resp.address;
+                        } else {
+                            if (tileAddrEl) tileAddrEl.textContent = 'N/A';
+                        }
+                    }).catch(() => { if (tileAddrEl) tileAddrEl.textContent = 'Error'; });
+            });
+            function enableTilePickMode(enable) {
+                if (!tileImgWrap) return;
+                tilePickActive = !!enable;
+                tileImgWrap.classList.toggle('pick-mode', tilePickActive);
+                [...tileImgWrap.querySelectorAll('.pick-hint')].forEach(n => n.remove());
+                if (tilePickActive) {
+                    const hint = document.createElement('div');
+                    hint.className = 'pick-hint';
+                    hint.textContent = 'Click a point to geocode';
+                    tileImgWrap.appendChild(hint);
+                }
+                if (tileGeocodePickBtn) tileGeocodePickBtn.textContent = tilePickActive ? 'Cancel Pick' : 'Pick Address Point';
+            }
+            if (tileGeocodePickBtn) tileGeocodePickBtn.addEventListener('click', () => {
+                enableTilePickMode(!tilePickActive);
+            });
+            if (tileImgWrap) tileImgWrap.addEventListener('click', (e) => {
+                if (!tilePickActive || !currentTileData) return;
+                const rect = tileImg.getBoundingClientRect();
+                const fx = Math.min(1, Math.max(0, (e.clientX - rect.left) / rect.width));
+                const fy = Math.min(1, Math.max(0, (e.clientY - rect.top) / rect.height));
+                const px = Math.round(fx * 256);
+                const py = Math.round(fy * 256);
+                // place marker
+                [...tileImgWrap.querySelectorAll('.pick-marker')].forEach(n => n.remove());
+                const m = document.createElement('div');
+                m.className = 'pick-marker';
+                m.style.left = `${fx * 100}%`;
+                m.style.top = `${fy * 100}%`;
+                tileImgWrap.appendChild(m);
+                const areaId = areaSelectMosaic.value || null;
+                const payload = { z: currentTileData.z, x: currentTileData.x, y: currentTileData.y, px, py, area_id: areaId };
+                fetch('/geocode', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify(payload) })
+                    .then(r => r.json()).then(resp => {
+                        if (resp && typeof resp.address === 'string') {
+                            if (tileAddrEl) tileAddrEl.textContent = resp.address;
+                        } else {
+                            if (tileAddrEl) tileAddrEl.textContent = 'N/A';
+                        }
+                    }).catch(() => { if (tileAddrEl) tileAddrEl.textContent = 'Error'; })
+                    .finally(() => enableTilePickMode(false));
             });
             const mosaicRefreshBtn = document.getElementById('mosaic-refresh');
             if (mosaicRefreshBtn) {
