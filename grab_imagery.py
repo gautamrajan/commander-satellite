@@ -1,10 +1,24 @@
 # grab_imagery.py
-import math, time, io, argparse, sys, os
+import math, time, io, argparse, sys, os, json
 from urllib.request import urlopen, Request
 from urllib.error import HTTPError, URLError
 
 import numpy as np
 from PIL import Image
+from typing import List, Tuple
+
+# Local utils
+try:
+    from kml_utils import (
+        parse_kml_polygons,
+        bbox_of_polygons,
+        any_polygon_contains,
+    )
+except Exception:
+    # Optional: geometry mode may import lazily
+    parse_kml_polygons = None
+    bbox_of_polygons = None
+    any_polygon_contains = None
 
 # Friendlier host for public basemap pulls
 IMAGERY_URL = "https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}"
@@ -204,44 +218,220 @@ def build_mosaic(lat_min, lon_min, lat_max, lon_max, z, out_tiff, out_png=None,
 
 # ---------- CLI ----------
 def main():
-    ap = argparse.ArgumentParser(description="Fetch Esri World_Imagery tiles around a point.")
-    ap.add_argument("--lat", type=float, required=True)
-    ap.add_argument("--lon", type=float, required=True)
-    ap.add_argument("--area_sqmi", type=float, required=True, help="Square miles around the point (square bbox).")
+    ap = argparse.ArgumentParser(description="Fetch Esri World_Imagery tiles around a point or a KML/geometry polygon.")
+    # Point + bbox mode (legacy)
+    ap.add_argument("--lat", type=float, required=False)
+    ap.add_argument("--lon", type=float, required=False)
+    ap.add_argument("--area_sqmi", type=float, required=False, help="Square miles around the point (square bbox).")
+    # Geometry/KML mode
+    ap.add_argument("--geometry_json", type=str, default=None, help="Path to JSON containing polygon list.")
+    ap.add_argument("--kml", type=str, default=None, help="Path to KML file defining polygon(s).")
     ap.add_argument("--auto_zoom", action="store_true", help="Probe highest available zoom at the point.")
     ap.add_argument("--max_zoom", type=int, default=23)
     ap.add_argument("--min_zoom", type=int, default=10)
     ap.add_argument("--zoom", type=int, default=None, help="Override zoom (skips probing).")
     ap.add_argument("--max_edge_px", type=int, default=12000, help="Cap longest image edge; auto lowers zoom if needed.")
     ap.add_argument("--max_tiles", type=int, default=20000, help="Safety cap on number of tiles (default ~20000).")
-    ap.add_argument("--tiff", type=str, required=True, help="Output GeoTIFF path.")
-    ap.add_argument("--png", type=str, default=None, help="Optional preview PNG path.")
+    ap.add_argument("--tiff", type=str, default=None, help="Output GeoTIFF path (required unless --no_mosaic).")
+    ap.add_argument("--png", type=str, default=None, help="Optional preview PNG path (ignored if --no_mosaic).")
+    ap.add_argument("--no_mosaic", action="store_true", help="Skip GeoTIFF/PNG outputs; only save z/x/y tiles.")
     ap.add_argument("--delay", type=float, default=0.03, help="Delay between tile requests.")
     ap.add_argument("--save_tiles_dir", type=str, default=None, help="Optional directory to save tiles as z/x/y.jpg.")
     args = ap.parse_args()
 
-    lat_min, lon_min, lat_max, lon_max = square_bbox_from_area(args.lat, args.lon, args.area_sqmi)
-    print(f"BBox: {lat_min:.6f},{lon_min:.6f} to {lat_max:.6f},{lon_max:.6f}")
+    def tile_center_latlon(x: int, y: int, z: int) -> Tuple[float, float]:
+        lat0, lon0 = tile_to_latlon(x, y, z)
+        lat1, lon1 = tile_to_latlon(x + 1, y + 1, z)
+        return ((lat0 + lat1) / 2.0, (lon0 + lon1) / 2.0)
 
-    # choose zoom
-    if args.zoom is not None:
-        z = args.zoom
-        print(f"Using fixed zoom: {z}")
-    else:
-        z_probe = probe_highest_zoom_with_imagery(args.lat, args.lon, args.max_zoom, args.min_zoom) if args.auto_zoom else 19
-        # keep within edge cap
-        R = 6371000.0
-        meters_edge = math.radians(lat_max - lat_min) * R  # N-S edge
-        z = cap_zoom_by_edge(args.lat, meters_edge, z_probe, args.max_edge_px)
-        if z < z_probe:
-            print(f"Zoom {z_probe} -> {z} to keep edge ≤ {args.max_edge_px}px")
+    # Determine mode
+    geometry_mode = bool(args.geometry_json or args.kml)
+
+    if not geometry_mode:
+        # Validate required inputs for bbox mode
+        if args.lat is None or args.lon is None or args.area_sqmi is None:
+            raise SystemExit("--lat, --lon, and --area_sqmi are required when not using --geometry_json/--kml")
+        if args.no_mosaic and not args.save_tiles_dir:
+            raise SystemExit("--no_mosaic requires --save_tiles_dir to persist tiles")
+
+        lat_min, lon_min, lat_max, lon_max = square_bbox_from_area(args.lat, args.lon, args.area_sqmi)
+        print(f"BBox: {lat_min:.6f},{lon_min:.6f} to {lat_max:.6f},{lon_max:.6f}")
+
+        # choose zoom
+        if args.zoom is not None:
+            z = args.zoom
+            print(f"Using fixed zoom: {z}")
         else:
-            print(f"Using zoom: {z}")
+            z_probe = probe_highest_zoom_with_imagery(args.lat, args.lon, args.max_zoom, args.min_zoom) if args.auto_zoom else 19
+            # keep within edge cap
+            R = 6371000.0
+            meters_edge = math.radians(lat_max - lat_min) * R  # N-S edge
+            z = cap_zoom_by_edge(args.lat, meters_edge, z_probe, args.max_edge_px)
+            if z < z_probe:
+                print(f"Zoom {z_probe} -> {z} to keep edge ≤ {args.max_edge_px}px")
+            else:
+                print(f"Using zoom: {z}")
 
-    build_mosaic(lat_min, lon_min, lat_max, lon_max, z,
-                 out_tiff=args.tiff, out_png=args.png,
-                 delay=args.delay, max_tiles=args.max_tiles,
-                 save_tiles_dir=args.save_tiles_dir)
+        if args.no_mosaic:
+            # Approximate grid, then fetch all tiles in bbox (no filtering)
+            x_min, y_max = latlon_to_tile(lat_min, lon_min, z)
+            x_max, y_min = latlon_to_tile(lat_max, lon_max, z)
+            cols = x_max - x_min + 1
+            rows = y_max - y_min + 1
+            total_tiles = cols * rows
+            if args.max_tiles and total_tiles > args.max_tiles:
+                raise SystemExit(f"Refusing to fetch {total_tiles} tiles (> max {args.max_tiles}). Reduce area or zoom.")
+            print(f"Fetching {total_tiles} tiles")
+            k = 0
+            for j, y in enumerate(range(y_min, y_max + 1)):
+                for i, x in enumerate(range(x_min, x_max + 1)):
+                    try:
+                        data = fetch_tile_bytes(z, x, y)
+                        img = Image.open(io.BytesIO(data)).convert("RGB")
+                        if looks_like_placeholder(img):
+                            # try parent
+                            substituted = False
+                            if z > 0:
+                                try:
+                                    x2, y2 = x//2, y//2
+                                    data2 = fetch_tile_bytes(z-1, x2, y2)
+                                    img2 = Image.open(io.BytesIO(data2)).convert("RGB").resize((256,256), Image.BILINEAR)
+                                    img = img2
+                                    substituted = True
+                                except Exception:
+                                    pass
+                            if not substituted:
+                                img = Image.new("RGB", (256,256), (255,255,255))
+                    except Exception:
+                        img = Image.new("RGB", (256,256), (255,255,255))
+
+                    if args.save_tiles_dir:
+                        try:
+                            tile_dir = os.path.join(args.save_tiles_dir, str(z), str(x))
+                            os.makedirs(tile_dir, exist_ok=True)
+                            tile_path = os.path.join(tile_dir, f"{y}.jpg")
+                            img.save(tile_path, format="JPEG")
+                        except Exception:
+                            pass
+                    k += 1
+                    if k % 100 == 0:
+                        print(f"{k}/{total_tiles} tiles")
+                    time.sleep(args.delay)
+            return
+        else:
+            # Build mosaic + optionally save tiles
+            if not args.tiff:
+                raise SystemExit("--tiff is required unless --no_mosaic is set")
+            build_mosaic(lat_min, lon_min, lat_max, lon_max, z,
+                         out_tiff=args.tiff, out_png=args.png,
+                         delay=args.delay, max_tiles=args.max_tiles,
+                         save_tiles_dir=args.save_tiles_dir)
+            return
+
+    # Geometry mode
+    if geometry_mode:
+        if args.no_mosaic and not args.save_tiles_dir:
+            raise SystemExit("--no_mosaic requires --save_tiles_dir to persist tiles")
+        polys: List[List[Tuple[float, float]]] = []
+        if args.geometry_json:
+            with open(args.geometry_json, 'r', encoding='utf-8') as f:
+                obj = json.load(f)
+            if isinstance(obj, dict) and 'polygons' in obj and isinstance(obj['polygons'], list):
+                polys = obj['polygons']
+            elif isinstance(obj, list):
+                polys = obj
+            else:
+                raise SystemExit("geometry_json must be a list of polygons or {'polygons': [...]} format")
+        elif args.kml:
+            if parse_kml_polygons is None:
+                raise SystemExit("KML parsing utilities not available")
+            polys = parse_kml_polygons(args.kml)
+
+        if not polys:
+            raise SystemExit("No polygons found for geometry mode")
+
+        # Determine bbox and zoom
+        lat_min, lon_min, lat_max, lon_max = bbox_of_polygons(polys)
+        print(f"BBox: {lat_min:.6f},{lon_min:.6f} to {lat_max:.6f},{lon_max:.6f}")
+        if args.zoom is not None:
+            z = args.zoom
+            print(f"Using fixed zoom: {z}")
+        else:
+            # Use provided lat/lon for probing if available, else bbox center
+            probe_lat = args.lat if args.lat is not None else (lat_min + lat_max) / 2.0
+            probe_lon = args.lon if args.lon is not None else (lon_min + lon_max) / 2.0
+            z_probe = probe_highest_zoom_with_imagery(probe_lat, probe_lon, args.max_zoom, args.min_zoom) if args.auto_zoom else 19
+            # Cap zoom only matters for mosaic, but keep consistent behavior
+            R = 6371000.0
+            meters_edge = math.radians(lat_max - lat_min) * R
+            z = cap_zoom_by_edge(probe_lat, meters_edge, z_probe, args.max_edge_px)
+            if z < z_probe:
+                print(f"Zoom {z_probe} -> {z} to keep edge ≤ {args.max_edge_px}px")
+            else:
+                print(f"Using zoom: {z}")
+
+        # Compute tile candidates within bbox
+        x_min, y_max = latlon_to_tile(lat_min, lon_min, z)  # SW
+        x_max, y_min = latlon_to_tile(lat_max, lon_max, z)  # NE
+        # Preselect tiles whose centers lie inside any polygon
+        selected: List[Tuple[int, int]] = []
+        for y in range(y_min, y_max + 1):
+            for x in range(x_min, x_max + 1):
+                c_lat, c_lon = tile_center_latlon(x, y, z)
+                if any_polygon_contains(c_lat, c_lon, polys):
+                    selected.append((x, y))
+
+        total_tiles = len(selected)
+        if args.max_tiles and total_tiles > args.max_tiles:
+            raise SystemExit(f"Refusing to fetch {total_tiles} tiles (> max {args.max_tiles}). Reduce area or zoom.")
+        print(f"Fetching {total_tiles} tiles")
+
+        # Optionally build mosaic: treat bbox mosaic as in legacy, but many users only need tiles
+        if not args.no_mosaic and args.tiff:
+            # Build mosaic of bbox to preserve existing behavior, while still saving only selected tiles
+            # For simplicity and to avoid masking, we keep the bbox mosaic identical to legacy.
+            build_mosaic(lat_min, lon_min, lat_max, lon_max, z,
+                         out_tiff=args.tiff, out_png=args.png,
+                         delay=0.0, max_tiles=None,  # we already enforce caps
+                         save_tiles_dir=None)
+            # Then fetch just selected tiles to save_tiles_dir if requested
+        
+        # Fetch and save selected tiles
+        k = 0
+        for (x, y) in selected:
+            try:
+                data = fetch_tile_bytes(z, x, y)
+                img = Image.open(io.BytesIO(data)).convert("RGB")
+                if looks_like_placeholder(img):
+                    substituted = False
+                    if z > 0:
+                        try:
+                            x2, y2 = x//2, y//2
+                            data2 = fetch_tile_bytes(z-1, x2, y2)
+                            img2 = Image.open(io.BytesIO(data2)).convert("RGB").resize((256,256), Image.BILINEAR)
+                            img = img2
+                            substituted = True
+                        except Exception:
+                            pass
+                    if not substituted:
+                        img = Image.new("RGB", (256,256), (255,255,255))
+            except Exception:
+                img = Image.new("RGB", (256,256), (255,255,255))
+
+            if args.save_tiles_dir:
+                try:
+                    tile_dir = os.path.join(args.save_tiles_dir, str(z), str(x))
+                    os.makedirs(tile_dir, exist_ok=True)
+                    tile_path = os.path.join(tile_dir, f"{y}.jpg")
+                    img.save(tile_path, format="JPEG")
+                except Exception:
+                    pass
+            k += 1
+            if k % 100 == 0:
+                print(f"{k}/{total_tiles} tiles")
+            time.sleep(args.delay)
+
+        return
 
 if __name__ == "__main__":
     main()

@@ -9,3 +9,4 @@ all_results.jsonl
 dumpsters.jsonl
 runs
 *.log
+__pycache__

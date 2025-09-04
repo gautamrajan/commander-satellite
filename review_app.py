@@ -7,6 +7,15 @@ import subprocess
 import shutil
 from datetime import datetime
 from flask import Flask, jsonify, render_template, request, send_from_directory
+from typing import List, Tuple
+
+# Optional KML helpers
+try:
+    from kml_utils import parse_kml_polygons, bbox_center, bbox_area_sqmi
+except Exception:
+    parse_kml_polygons = None
+    bbox_center = None
+    bbox_area_sqmi = None
 
 # Import detection type configuration
 from detection_types import get_available_detection_types, get_detection_type, get_output_filename
@@ -469,7 +478,7 @@ def list_tiles_at_zoom(z: int):
 				"reviewed": review_status.get("reviewed", False),
 				"approved": review_status.get("approved", None),
 				"coarse_negative": is_coarse_neg,
-				"image_url": f"/image/{rel_path.replace('\\', '/')}",
+				"image_url": "/image/" + rel_path.replace("\\", "/"),
 			})
 			min_x = x_val if min_x is None else min(min_x, x_val)
 			max_x = x_val if max_x is None else max(max_x, x_val)
@@ -562,7 +571,7 @@ def list_tiles_at_zoom_for_area(area_id: str, z: int):
 				"reviewed": rmeta.get("reviewed", False),
 				"approved": rmeta.get("approved", None),
 				"coarse_negative": is_coarse_neg,
-				"image_url": f"/areas/{area_id}/image/{rel_path.replace('\\', '/')}",
+				"image_url": "/areas/" + area_id + "/image/" + rel_path.replace("\\", "/"),
 			})
 			min_x = x_val if min_x is None else min(min_x, x_val)
 			max_x = x_val if max_x is None else max(max_x, x_val)
@@ -641,6 +650,95 @@ def create_area():
     return jsonify({"area_id": area_id, "area": area_obj})
 
 
+@app.route("/areas/import_kml", methods=["POST"])
+def import_kml_area():
+    if parse_kml_polygons is None:
+        return jsonify({"error": "KML parsing not available"}), 500
+    f = request.files.get("kml") or request.files.get("file")
+    if not f:
+        return jsonify({"error": "missing file 'kml'"}), 400
+    name = (request.form.get("name") or os.path.splitext(f.filename or "KML Area")[0]).strip() or "KML Area"
+    zoom_raw = (request.form.get("zoom") or "").strip()
+    zoom = int(zoom_raw) if zoom_raw.isdigit() else None
+
+    # Read file into temp path to parse
+    import tempfile
+    with tempfile.NamedTemporaryFile(delete=False, suffix=".kml") as tf:
+        kml_tmp = tf.name
+        data = f.read()
+        tf.write(data)
+    try:
+        polys = parse_kml_polygons(kml_tmp)
+    finally:
+        try:
+            os.remove(kml_tmp)
+        except Exception:
+            pass
+    if not polys:
+        return jsonify({"error": "no polygons found in KML"}), 400
+
+    # Compute center and rough area from bbox
+    try:
+        ctr_lat, ctr_lon = bbox_center(polys)
+    except Exception:
+        ctr_lat, ctr_lon = polys[0][0]
+    try:
+        # derive bbox again to compute area
+        lat_min = min(lat for poly in polys for lat, _ in poly)
+        lat_max = max(lat for poly in polys for lat, _ in poly)
+        lon_min = min(lon for poly in polys for _, lon in poly)
+        lon_max = max(lon for poly in polys for _, lon in poly)
+        area_sqmi = bbox_area_sqmi(lat_min, lon_min, lat_max, lon_max)
+    except Exception:
+        area_sqmi = 0.25
+
+    area_id = _generate_area_id()
+    p = area_paths(area_id)
+    os.makedirs(p["base"], exist_ok=True)
+    os.makedirs(p["tiles"], exist_ok=True)
+    os.makedirs(p["logs"], exist_ok=True)
+
+    # Persist original KML
+    try:
+        with open(os.path.join(p["base"], "source.kml"), "wb") as out_kml:
+            out_kml.write(data)
+    except Exception:
+        pass
+
+    # Normalize polygons to JSON-serializable list of [lat, lon]
+    geometry = [[ [float(lat), float(lon)] for (lat, lon) in poly ] for poly in polys]
+
+    area_obj = {
+        "id": area_id,
+        "name": name,
+        "center": {"lat": ctr_lat, "lon": ctr_lon},
+        "area_sqmi": area_sqmi,
+        "zoom": zoom,
+        "geometry": geometry,
+        "created_at": time.time(),
+        "status": {"fetch": "idle", "scan": "idle"},
+        "paths": {
+            "tiles": p["tiles"],
+            "all_results": p["all_results"],
+            "dumpsters": p["dumpsters"],
+            "reviewed": p["reviewed"],
+        },
+    }
+    _safe_write_json(p["area_json"], area_obj)
+
+    idx = load_areas_index()
+    idx.setdefault("areas", []).append({
+        "id": area_id,
+        "name": name,
+        "center": {"lat": ctr_lat, "lon": ctr_lon},
+        "area_sqmi": area_sqmi,
+        "zoom": zoom,
+        "created_at": area_obj["created_at"],
+    })
+    save_areas_index(idx)
+    return jsonify({"area_id": area_id, "area": area_obj})
+
+
 @app.route("/areas/<area_id>", methods=["GET"])
 def get_area(area_id: str):
     p = area_paths(area_id)
@@ -699,23 +797,52 @@ def area_fetch_start(area_id: str):
     if not area_obj:
         return jsonify({"error": "area not found"}), 404
 
-    center = area_obj.get("center")
-    area_sqmi = area_obj.get("area_sqmi") or 0.25
+    center = area_obj.get("center") or {}
     zoom = area_obj.get("zoom")
 
-    cmd = [
-        sys.executable, "grab_imagery.py",
-        "--lat", str(center.get("lat")),
-        "--lon", str(center.get("lon")),
-        "--area_sqmi", str(area_sqmi),
-        "--tiff", p["tiff"],
-        "--png", p["png"],
-        "--save_tiles_dir", p["tiles"],
-    ]
-    if zoom is not None and str(zoom).strip() != "":
-        cmd += ["--zoom", str(int(zoom))]
+    geometry = area_obj.get("geometry")
+    if geometry:
+        # Write geometry to a sidecar file for the fetcher
+        geo_path = os.path.join(p["base"], "geometry.json")
+        try:
+            with open(geo_path, "w", encoding="utf-8") as gf:
+                # Accept either list of polygons or wrapper dict
+                if isinstance(geometry, dict):
+                    json.dump(geometry, gf)
+                else:
+                    json.dump({"polygons": geometry}, gf)
+        except Exception as e:
+            return jsonify({"error": f"failed to write geometry: {e}"}), 500
+
+        cmd = [
+            sys.executable, "grab_imagery.py",
+            "--geometry_json", geo_path,
+            "--save_tiles_dir", p["tiles"],
+            "--no_mosaic",
+        ]
+        # If center available, pass for auto-zoom probe
+        if center.get("lat") is not None and center.get("lon") is not None:
+            cmd += ["--lat", str(center.get("lat")), "--lon", str(center.get("lon"))]
+        if zoom is not None and str(zoom).strip() != "":
+            cmd += ["--zoom", str(int(zoom))]
+        else:
+            cmd += ["--auto_zoom"]
     else:
-        cmd += ["--auto_zoom"]
+        # Legacy bbox mode
+        area_sqmi = area_obj.get("area_sqmi") or 0.25
+        cmd = [
+            sys.executable, "grab_imagery.py",
+            "--lat", str(center.get("lat")),
+            "--lon", str(center.get("lon")),
+            "--area_sqmi", str(area_sqmi),
+            "--tiff", p["tiff"],
+            "--png", p["png"],
+            "--save_tiles_dir", p["tiles"],
+        ]
+        if zoom is not None and str(zoom).strip() != "":
+            cmd += ["--zoom", str(int(zoom))]
+        else:
+            cmd += ["--auto_zoom"]
 
     os.makedirs(p["logs"], exist_ok=True)
 

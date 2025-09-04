@@ -1,0 +1,21 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<kml xmlns="http://www.opengis.net/kml/2.2">
+  <Document>
+    <name>LA_Construction_AOIs_v2_1</name>
+    <open>1</open>
+    <Style id="aoi-poly">
+      <LineStyle><width>2</width></LineStyle>
+      <PolyStyle><fill>1</fill><outline>1</outline><color>7d00ffff</color></PolyStyle>
+    </Style>
+
+    <Placemark>
+      <name>Culver City – Hayden Tract &amp; Ivy Station (Pilot AOI)</name>
+
+      <styleUrl>#aoi-poly</styleUrl>
+      <Polygon><tessellate>1</tessellate><outerBoundaryIs><LinearRing><coordinates>
+        -118.397,34.04,0 -118.37,34.04,0 -118.37,34.017,0 -118.397,34.017,0 -118.397,34.04,0
+      </coordinates></LinearRing></outerBoundaryIs></Polygon>
+    </Placemark>
+
+  </Document>
+</kml>

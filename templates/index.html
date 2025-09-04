@@ -31,7 +31,9 @@
                         <div class="row"><label>Center Lon</label><input id="area-lon" type="number" step="0.000001" placeholder="Click map"/></div>
                         <div class="row"><label>Area (sq mi)</label><input id="area-sqmi" type="number" step="0.01" value="0.25"/></div>
                         <div class="row"><label>Zoom</label><input id="area-zoom" type="number" placeholder="auto"/></div>
+                        <div class="row"><label>KML</label><input id="area-kml" type="file" accept=".kml"/></div>
                         <div class="actions"><button id="area-create">Create Area</button></div>
+                        <div class="actions" style="margin-top:8px;"><button id="area-import-kml">Import KML as Area</button></div>
                     </div>
                 </div>
                 <div class="areas-right">
@@ -291,7 +293,9 @@
             const areaLonInput = document.getElementById('area-lon');
             const areaSqmiInput = document.getElementById('area-sqmi');
             const areaZoomInput = document.getElementById('area-zoom');
+            const areaKmlInput = document.getElementById('area-kml');
             const areaCreateBtn = document.getElementById('area-create');
+            const areaImportBtn = document.getElementById('area-import-kml');
 
             // Leaflet map
             const map = L.map('map').setView([37.7749, -122.4194], 12);
@@ -354,7 +358,6 @@
                                 </div>
                                 <div class="area-actions">
                                     <button data-action="fetch" data-id="${a.id}">Fetch</button>
-                                    <button data-action="scan" data-id="${a.id}">Scan</button>
                                     <button data-action="review" data-id="${a.id}">Review</button>
                                     <button data-action="mosaic" data-id="${a.id}">Mosaic</button>
                                 </div>
@@ -456,6 +459,28 @@
                 if (zoomVal) payload.zoom = Number(zoomVal);
                 fetch('/areas', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload) })
                     .then(r => r.json()).then(() => refreshAreas());
+            });
+
+            if (areaImportBtn) areaImportBtn.addEventListener('click', () => {
+                const files = areaKmlInput.files;
+                if (!files || !files.length) { alert('Choose a .kml file first'); return; }
+                const fd = new FormData();
+                fd.append('kml', files[0]);
+                const name = areaNameInput.value.trim();
+                const zoomVal = areaZoomInput.value.trim();
+                if (name) fd.append('name', name);
+                if (zoomVal) fd.append('zoom', zoomVal);
+                fetch('/areas/import_kml', { method: 'POST', body: fd })
+                    .then(r => r.json())
+                    .then(resp => {
+                        if (resp && resp.area_id) {
+                            areaKmlInput.value = '';
+                            refreshAreas();
+                        } else {
+                            alert('Failed to import KML');
+                        }
+                    })
+                    .catch(() => alert('Failed to import KML'));
             });
 
             function loadDetectionsForArea() {
