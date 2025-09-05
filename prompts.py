@@ -224,6 +224,25 @@ Set construction_site=true if confidence ≥ 0.4 (lower threshold for coarse sca
 Respond ONLY with JSON: {"construction_site": true|false, "confidence": number between 0 and 1}"""
 
 
+def get_construction_boxes_prompt(scan_type: str = 'base', context_radius: int = 0) -> str:
+    """Prompt to return bounding boxes (and optional masks) as a JSON object.
+
+    We ask for a top-level object with a key `detections` to satisfy JSON object response format.
+    """
+    context_note = "Focus ONLY on the CENTRAL tile region of the stitched image when making decisions." if (scan_type == 'context' or context_radius > 0) else ""
+    return (
+        "Analyze this satellite image for ACTIVE construction sites. "
+        + context_note
+        + "\nReturn a JSON object with a key 'detections' containing a list of entries.\n"
+          "Each detection entry must contain: \n"
+          "- 'box_2d': [x0, y0, x1, y1] bounding box in image pixel coordinates (integers).\n"
+          "- 'label': short descriptive label (e.g., 'residential construction').\n"
+          "- 'confidence': number between 0 and 1.\n"
+          "- 'mask' (optional): segmentation mask (RLE or compact format).\n"
+          "Example: {\"detections\":[{\"box_2d\":[10,20,120,140],\"label\":\"residential construction\",\"confidence\":0.92}]}\n"
+    )
+
+
 def get_prompt_for_scan_type(scan_type: str, context_radius: int = 0, detection_type: str = "dumpsters") -> str:
     """
     Get the appropriate prompt based on scanning context and detection type.

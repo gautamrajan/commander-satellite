@@ -192,15 +192,13 @@
             <div class="scan-form">
                 <div class="row">
                     <label>Area</label>
-                    <select id="scan-area-select">
-                        <option value="">Global (tiles/)</option>
-                    </select>
+                    <select id="scan-area-select"></select>
                 </div>
                 <div class="row">
                     <label>Detection Type</label>
                     <select id="scan-detection-type">
+                        <option value="construction" selected>Construction Site Detection</option>
                         <option value="dumpsters">Dumpster Detection</option>
-                        <option value="construction">Construction Site Detection</option>
                     </select>
                 </div>
                 <div class="row">
@@ -209,15 +207,15 @@
                 </div>
                 <div class="row">
                     <label>Model</label>
-                    <input id="scan-model" type="text" value="google/gemini-2.5-pro">
+                    <input id="scan-model" type="text" value="google/gemini-2.5-flash">
                 </div>
                 <div class="row">
                     <label>RPM</label>
-                    <input id="scan-rpm" type="number" value="60">
+                    <input id="scan-rpm" type="number" value="1000">
                 </div>
                 <div class="row">
                     <label>Concurrency</label>
-                    <input id="scan-concurrency" type="number" value="1" min="1" max="32">
+                    <input id="scan-concurrency" type="number" value="200" min="1" max="512">
                 </div>
                 <div class="row">
                     <label>Min confidence</label>
@@ -250,6 +248,7 @@
                     <button id="scan-start">Start Scan</button>
                     <button id="scan-stop" disabled>Stop Scan</button>
                     <button id="scan-clear" class="danger">Clear Scan Data</button>
+                    <button id="scan-events-open" style="float:right;">LLM Requests</button>
                 </div>
             </div>
             <div class="scan-status">
@@ -268,6 +267,39 @@
             <div class="scan-logs">
                 <pre id="scan-stdout"></pre>
                 <pre id="scan-stderr"></pre>
+            </div>
+        </div>
+    </div>
+    <!-- LLM Events Modal -->
+    <div id="llm-events-modal" class="events-overlay" role="dialog" aria-modal="true">
+        <div class="events-inner">
+            <div class="events-toolbar">
+                <div class="left">
+                    <strong>LLM Requests</strong>
+                    <div class="events-controls">
+                        <label><input type="checkbox" id="events-autoscroll" checked> Auto-scroll</label>
+                        <select id="events-filter">
+                            <option value="all">All</option>
+                            <option value="queued">Queued</option>
+                            <option value="sent">Sent</option>
+                            <option value="done">Done</option>
+                            <option value="error">Error</option>
+                        </select>
+                    </div>
+                    <div class="metrics">
+                        <span>Queued: <span id="ev-m-queued">0</span></span>
+                        <span>Sent: <span id="ev-m-sent">0</span></span>
+                        <span>Done: <span id="ev-m-done">0</span></span>
+                        <span>Error: <span id="ev-m-error">0</span></span>
+                    </div>
+                </div>
+                <div class="right">
+                    <button id="events-clear" class="danger">Clear</button>
+                    <button id="scan-events-close">Close</button>
+                </div>
+            </div>
+            <div class="events-body">
+                <div id="events-list" class="events-list"></div>
             </div>
         </div>
     </div>
@@ -343,7 +375,34 @@
                     }
                     fillSelect(areaSelectReview);
                     fillSelect(areaSelectMosaic);
-                    fillSelect(scanAreaSelect);
+                    // Custom fill for scanAreaSelect: no Global option; default to most recent area
+                    (function fillScanSelect(sel) {
+                        const current = sel.value;
+                        sel.innerHTML = '';
+                        for (const a of list) {
+                            const opt = document.createElement('option');
+                            opt.value = a.id; opt.textContent = a.name || a.id;
+                            opt.dataset.createdAt = String(a.created_at || 0);
+                            sel.appendChild(opt);
+                        }
+                        // If current still present, keep; else select most recently created
+                        if (current && [...sel.options].some(o => o.value === current)) {
+                            sel.value = current;
+                        } else if (sel.options.length) {
+                            let newest = sel.options[0];
+                            for (const o of sel.options) {
+                                const ca = parseFloat(o.dataset.createdAt || '0');
+                                const cb = parseFloat(newest.dataset.createdAt || '0');
+                                if (ca > cb) newest = o;
+                            }
+                            sel.value = newest.value;
+                        }
+                        // Ensure tiles dir reflects the chosen area immediately
+                        const tilesDirEl = document.getElementById('scan-tiles-dir');
+                        if (tilesDirEl) {
+                            tilesDirEl.value = sel.value ? `runs/${sel.value}/tiles` : 'tiles';
+                        }
+                    })(scanAreaSelect);
 
                     for (const a of list) {
                         const row = document.createElement('div');
@@ -435,7 +494,7 @@
                                 fetch(`/areas/${id}/fetch/start`, {method: 'POST'}).then(() => {});
                             } else if (action === 'scan') {
                                 const payload = {
-                                    detection_type: detectionTypeSelect.value || 'dumpsters'
+                                    detection_type: detectionTypeSelect.value || 'construction'
                                 };
                                 fetch(`/areas/${id}/scan/start`, {method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify(payload)}).then(() => {});
                             } else if (action === 'review') {
@@ -1092,7 +1151,7 @@
                 input.addEventListener('input', updateRequestEstimate);
             });
 
-            // Load detection types and populate dropdown
+            // Load detection types and populate dropdown (default to construction)
             fetch('/detection_types')
                 .then(r => r.json())
                 .then(types => {
@@ -1101,7 +1160,7 @@
                         const option = document.createElement('option');
                         option.value = type.id;
                         option.textContent = type.name;
-                        if (type.id === 'dumpsters') option.selected = true; // Default selection
+                        if (type.id === 'construction') option.selected = true; // Default selection
                         detectionTypeSelect.appendChild(option);
                     }
                 })
@@ -1109,11 +1168,15 @@
                     console.error('Failed to load detection types:', err);
                     // Fallback to hardcoded options if API fails
                     detectionTypeSelect.innerHTML = `
-                        <option value="dumpsters" selected>Dumpster Detection</option>
-                        <option value="construction">Construction Site Detection</option>
+                        <option value="construction" selected>Construction Site Detection</option>
+                        <option value="dumpsters">Dumpster Detection</option>
                     `;
                 });
 
+            // Ensure tiles dir reflects selected area before initial estimate
+            if (scanAreaSelect) {
+                scanAreaSelect.dispatchEvent(new Event('change'));
+            }
             // Initial estimate
             updateRequestEstimate();
 
@@ -1151,14 +1214,110 @@
             }
             setInterval(pollStatus, 2000);
 
+            // ===== LLM Events Panel =====
+            const eventsModal = document.getElementById('llm-events-modal');
+            const btnEventsOpen = document.getElementById('scan-events-open');
+            const btnEventsClose = document.getElementById('scan-events-close');
+            const btnEventsClear = document.getElementById('events-clear');
+            const eventsList = document.getElementById('events-list');
+            const eventsFilter = document.getElementById('events-filter');
+            const autoScrollChk = document.getElementById('events-autoscroll');
+            const metricQueued = document.getElementById('ev-m-queued');
+            const metricSent = document.getElementById('ev-m-sent');
+            const metricDone = document.getElementById('ev-m-done');
+            const metricError = document.getElementById('ev-m-error');
+
+            let eventsData = [];
+            let eventsSource = null;
+
+            function fmtPath(e) {
+                if (e.path) return e.path;
+                if (typeof e.z === 'number' && typeof e.x === 'number' && typeof e.y === 'number') {
+                    return `${e.z}/${e.x}/${e.y}.jpg`;
+                }
+                return '-';
+            }
+
+            function renderEvents() {
+                const filter = eventsFilter.value;
+                eventsList.innerHTML = '';
+                let q=0,s=0,d=0,er=0;
+                for (const ev of eventsData) {
+                    if (ev.type === 'queued') q++; else if (ev.type==='sent') s++; else if (ev.type==='done') d++; else if (ev.type==='error') er++;
+                }
+                metricQueued.textContent = q; metricSent.textContent = s; metricDone.textContent = d; metricError.textContent = er;
+                const toShow = eventsData.filter(ev => filter==='all' || ev.type===filter);
+                for (const ev of toShow) {
+                    const row = document.createElement('div');
+                    row.className = 'event-row';
+                    const etype = document.createElement('div'); etype.className = 'etype ' + ev.type; etype.textContent = ev.type;
+                    const estage = document.createElement('div'); estage.textContent = ev.scan_type || '-';
+                    const epath = document.createElement('div'); epath.textContent = fmtPath(ev);
+                    const etime = document.createElement('div'); etime.textContent = new Date((ev.ts||0)*1000).toLocaleTimeString();
+                    row.appendChild(etype); row.appendChild(estage); row.appendChild(epath); row.appendChild(etime);
+                    const detail = document.createElement('div');
+                    detail.className = 'event-detail';
+                    let detailText = '';
+                    if (ev.prompt) {
+                        detailText += `Prompt:\n${ev.prompt}\n\n`;
+                    }
+                    if (ev.response_text) {
+                        detailText += `Response:\n${ev.response_text}\n`;
+                    }
+                    if (ev.error) {
+                        detailText += `Error: ${ev.error}\n`;
+                    }
+                    if (!detailText) detailText = '(no details)';
+                    detail.textContent = detailText;
+                    detail.style.display = 'none';
+                    row.addEventListener('click', () => {
+                        detail.style.display = (detail.style.display === 'none') ? 'block' : 'none';
+                    });
+                    const wrap = document.createElement('div');
+                    wrap.appendChild(row); wrap.appendChild(detail);
+                    eventsList.appendChild(wrap);
+                }
+                if (autoScrollChk && autoScrollChk.checked) {
+                    eventsList.scrollTop = eventsList.scrollHeight;
+                }
+            }
+
+            function openEvents() {
+                eventsModal.classList.add('active');
+                // reset and start SSE stream
+                eventsData = []; eventsList.innerHTML='';
+                if (eventsSource) { try { eventsSource.close(); } catch(e){} }
+                eventsSource = new EventSource('/scan/events/stream?tail=500');
+                eventsSource.onmessage = (e) => {
+                    try {
+                        const ev = JSON.parse(e.data);
+                        eventsData.push(ev);
+                        renderEvents();
+                    } catch(err) {}
+                };
+                eventsSource.onerror = () => {
+                    // let the browser auto-reconnect; optionally show a subtle status
+                };
+            }
+            function closeEvents() {
+                eventsModal.classList.remove('active');
+                if (eventsSource) { try { eventsSource.close(); } catch(e){} eventsSource = null; }
+            }
+            if (btnEventsOpen) btnEventsOpen.addEventListener('click', openEvents);
+            if (btnEventsClose) btnEventsClose.addEventListener('click', closeEvents);
+            if (eventsFilter) eventsFilter.addEventListener('change', renderEvents);
+            if (btnEventsClear) btnEventsClear.addEventListener('click', () => {
+                fetch('/scan/events/clear', { method: 'POST' }).then(() => { eventsData=[]; eventsList.innerHTML=''; renderEvents(); });
+            });
+
             btnStart.addEventListener('click', () => {
                 const payload = {
                     area_id: scanAreaSelect.value || null,
-                    detection_type: detectionTypeSelect.value || 'dumpsters',
+                    detection_type: detectionTypeSelect.value || 'construction',
                     tiles_dir: tilesDirInput.value || 'tiles',
-                    model: modelInput.value || 'google/gemini-2.5-pro',
-                    rpm: Number(rpmInput.value || 60),
-                    concurrency: Number(concurrencyInput.value || 1),
+                    model: modelInput.value || 'google/gemini-2.5-flash',
+                    rpm: Number(rpmInput.value || 1000),
+                    concurrency: Number(concurrencyInput.value || 200),
                     min_confidence: Number(minConfInput.value || 0.5),
                     context_radius: Number(ctxInput.value || 0),
                     coarse_factor: Number(coarseFactorInput.value || 0),

@@ -8,8 +8,9 @@ import logging
 import mimetypes
 import threading
 import queue
-from typing import Generator, Iterable, Optional, Tuple, Dict, Any
+from typing import Generator, Iterable, Optional, Tuple, Dict, Any, List, Callable
 from io import BytesIO
+import math
 
 from PIL import Image as PILImage
 
@@ -17,8 +18,19 @@ from langchain_openai import ChatOpenAI
 from langchain_core.messages import HumanMessage, SystemMessage
 
 # Import enhanced prompting module
-from prompts import get_enhanced_system_prompt, get_prompt_for_scan_type, add_hard_negatives_to_prompt, get_detection_response_key
+from prompts import (
+    get_enhanced_system_prompt,
+    get_prompt_for_scan_type,
+    add_hard_negatives_to_prompt,
+    get_detection_response_key,
+    get_construction_boxes_prompt,
+)
 from detection_types import get_detection_type, validate_detection_type, get_output_filename
+from geom.tile_math import bbox_px_to_merc_polygon, ring_to_wkt, bbox_center_lonlat
+try:
+    from db.writer import DbClient
+except Exception:
+    DbClient = None  # type: ignore
 
 # Optional: auto-load .env if python-dotenv is available
 try:
@@ -29,6 +41,67 @@ except Exception:
 
 
 OPENROUTER_API_URL = "https://openrouter.ai/api/v1/chat/completions"
+
+
+class EventLogger:
+    """Thread-safe JSONL event logger for scanner request visibility.
+
+    Writes compact JSON objects per line to a file. Each event gets a monotonically
+    increasing sequence number `seq` and a timestamp `ts`.
+    """
+    def __init__(self, path: Optional[str]) -> None:
+        self.path = path
+        self._lock = threading.Lock()
+        self._seq = 0
+        self._fp = None
+        if path:
+            # Lazy open on first write
+            os.makedirs(os.path.dirname(os.path.abspath(path)) or ".", exist_ok=True)
+
+    def _ensure_open(self):
+        if self._fp is None and self.path:
+            self._fp = open(self.path, "a", encoding="utf-8")
+
+    def emit(self, ev: Dict[str, Any]) -> None:
+        if not self.path:
+            return
+        try:
+            with self._lock:
+                self._ensure_open()
+                self._seq += 1
+                ev_out = dict(ev)
+                ev_out.setdefault("seq", self._seq)
+                ev_out.setdefault("ts", time.time())
+                self._fp.write(json.dumps(ev_out, ensure_ascii=False) + "\n")
+                self._fp.flush()
+        except Exception:
+            # Never let logging break the scanner
+            pass
+
+    def close(self):
+        try:
+            if self._fp is not None:
+                self._fp.close()
+        except Exception:
+            pass
+
+def silence_external_loggers():
+    """Reduce noisy INFO logs from HTTP/LLM libs unless explicitly enabled.
+    Controlled by env var SCANNER_SILENCE_HTTP (default: '1' = silence)."""
+    if os.getenv("SCANNER_SILENCE_HTTP", "1") != "1":
+        return
+    import logging as _logging
+    for name in ("httpx", "httpcore", "openai", "langchain", "langchain_core", "langchain_openai", "urllib3"):
+        lg = _logging.getLogger(name)
+        lg.setLevel(_logging.WARNING)
+        lg.propagate = False
+
+def _maybe_trace(msg: str) -> None:
+    if os.getenv("SCANNER_TRACE") == "1":
+        try:
+            print(msg, file=sys.stderr)
+        except Exception:
+            pass
 
 
 def determine_mime_type(file_path: str) -> str:
@@ -210,15 +283,28 @@ def call_openrouter_with_image(
     scan_type: str = 'base',
     context_radius: int = 0,
     detection_type: str = 'dumpsters',
+    use_boxes: bool = False,
+    events: Optional[EventLogger] = None,
+    event_meta: Optional[Dict[str, Any]] = None,
 ) -> Tuple[Optional[Dict[str, Any]], float, Dict[str, Any]]:
     """Send image using LangChain ChatOpenAI and return parsed JSON result and updated last_call_time.
 
     Returns (result_dict_or_none, last_call_time, info)
     """
     system_prompt = get_enhanced_system_prompt(detection_type)
-    
+
+    # Choose the correct prompt based on scan stage and detection type.
+    # Important: for 'coarse' stage we must use the coarse prompt that returns
+    # a simple boolean + confidence (NOT the boxes prompt), otherwise every
+    # coarse call will be treated as negative.
     if prompt_text is None:
-        prompt = get_prompt_for_scan_type(scan_type, context_radius, detection_type)
+        if scan_type == 'coarse':
+            # Coarse stage always uses boolean+confidence prompt
+            prompt = get_prompt_for_scan_type(scan_type, context_radius, detection_type)
+        elif detection_type == 'construction' and use_boxes:
+            prompt = get_construction_boxes_prompt(scan_type, context_radius)
+        else:
+            prompt = get_prompt_for_scan_type(scan_type, context_radius, detection_type)
     else:
         prompt = prompt_text
 
@@ -237,6 +323,29 @@ def call_openrouter_with_image(
                     ]
                 ),
             ]
+            # Emit 'sent' event with full prompt
+            try:
+                if events is not None:
+                    base = event_meta or {}
+                    ev = {
+                        **{k: v for k, v in base.items() if v is not None},
+                        "type": "sent",
+                        "scan_type": scan_type,
+                        "detection_type": detection_type,
+                        "model": getattr(llm, "model", None) or None,
+                        "prompt": prompt,
+                        "attempt": attempt,
+                    }
+                    events.emit(ev)
+            except Exception:
+                pass
+            # Optional debug visibility
+            try:
+                import os
+                if os.getenv('SCANNER_DEBUG') == '1':
+                    print(f"LLM call: type={scan_type} det={detection_type} prompt={prompt[:200]!r}...", file=sys.stderr)
+            except Exception:
+                pass
             ok, val = _invoke_with_timeout(llm.invoke, (messages,), 60.0)
             if not ok:
                 if attempt <= max_retries:
@@ -244,6 +353,21 @@ def call_openrouter_with_image(
                     time.sleep(backoff)
                     continue
                 info = {"variant": None, "error": f"llm_timeout_or_error: {val}"}
+                # Emit error event
+                try:
+                    if events is not None:
+                        base = event_meta or {}
+                        events.emit({
+                            **{k: v for k, v in base.items() if v is not None},
+                            "type": "error",
+                            "scan_type": scan_type,
+                            "detection_type": detection_type,
+                            "model": getattr(llm, "model", None) or None,
+                            "prompt": prompt,
+                            "error": info["error"],
+                        })
+                except Exception:
+                    pass
                 return None, last, info
             ai_msg = val
         except Exception as e:
@@ -252,6 +376,20 @@ def call_openrouter_with_image(
                 time.sleep(backoff + (0.2 * backoff * (0.5 - os.urandom(1)[0] / 255.0)))
                 continue
             info = {"variant": None, "error": f"llm_exception: {e.__class__.__name__}: {e}"}
+            try:
+                if events is not None:
+                    base = event_meta or {}
+                    events.emit({
+                        **{k: v for k, v in base.items() if v is not None},
+                        "type": "error",
+                        "scan_type": scan_type,
+                        "detection_type": detection_type,
+                        "model": getattr(llm, "model", None) or None,
+                        "prompt": prompt,
+                        "error": info["error"],
+                    })
+            except Exception:
+                pass
             return None, last, info
 
         # Extract content
@@ -272,7 +410,29 @@ def call_openrouter_with_image(
             "response_excerpt": None,
             "content_text_excerpt": (content_text or "")[:400],
             "usage": getattr(ai_msg, "usage_metadata", None),
+            "prompt_excerpt": (prompt or "")[:300],
+            "prompt_full": prompt,
+            "scan_type": scan_type,
+            "detection_type": detection_type,
+            "content_text": content_text,
         }
+        # Emit done event with full prompt/response
+        try:
+            if events is not None:
+                base = event_meta or {}
+                events.emit({
+                    **{k: v for k, v in base.items() if v is not None},
+                    "type": "done",
+                    "scan_type": scan_type,
+                    "detection_type": detection_type,
+                    "model": getattr(llm, "model", None) or None,
+                    "prompt": prompt,
+                    "response_text": content_text,
+                    "status": info.get("status"),
+                    "result": result,
+                })
+        except Exception:
+            pass
         return result, last, info
 
 
@@ -306,12 +466,20 @@ def call_openrouter_with_image_parallel(
     scan_type: str = 'base',
     context_radius: int = 0,
     detection_type: str = 'dumpsters',
+    use_boxes: bool = False,
+    events: Optional[EventLogger] = None,
+    event_meta: Optional[Dict[str, Any]] = None,
 ) -> Tuple[Optional[Dict[str, Any]], Dict[str, Any]]:
     """Parallel-safe variant that relies on a shared RateLimiter (no per-call state)."""
     system_prompt = get_enhanced_system_prompt(detection_type)
-    
+
     if prompt_text is None:
-        prompt = get_prompt_for_scan_type(scan_type, context_radius, detection_type)
+        if scan_type == 'coarse':
+            prompt = get_prompt_for_scan_type(scan_type, context_radius, detection_type)
+        elif detection_type == 'construction' and use_boxes:
+            prompt = get_construction_boxes_prompt(scan_type, context_radius)
+        else:
+            prompt = get_prompt_for_scan_type(scan_type, context_radius, detection_type)
     else:
         prompt = prompt_text
 
@@ -329,6 +497,28 @@ def call_openrouter_with_image_parallel(
                     ]
                 ),
             ]
+            # Emit 'sent' event
+            try:
+                if events is not None:
+                    base = event_meta or {}
+                    events.emit({
+                        **{k: v for k, v in base.items() if v is not None},
+                        "type": "sent",
+                        "scan_type": scan_type,
+                        "detection_type": detection_type,
+                        "model": getattr(llm, "model", None) or None,
+                        "prompt": prompt,
+                        "attempt": attempt,
+                    })
+            except Exception:
+                pass
+            # Optional debug visibility
+            try:
+                import os
+                if os.getenv('SCANNER_DEBUG') == '1':
+                    print(f"LLM call: type={scan_type} det={detection_type} prompt={prompt[:200]!r}...", file=sys.stderr)
+            except Exception:
+                pass
             ok, val = _invoke_with_timeout(llm.invoke, (messages,), 60.0)
             if not ok:
                 if attempt <= max_retries:
@@ -336,6 +526,20 @@ def call_openrouter_with_image_parallel(
                     time.sleep(backoff)
                     continue
                 info = {"variant": None, "error": f"llm_timeout_or_error: {val}"}
+                try:
+                    if events is not None:
+                        base = event_meta or {}
+                        events.emit({
+                            **{k: v for k, v in base.items() if v is not None},
+                            "type": "error",
+                            "scan_type": scan_type,
+                            "detection_type": detection_type,
+                            "model": getattr(llm, "model", None) or None,
+                            "prompt": prompt,
+                            "error": info["error"],
+                        })
+                except Exception:
+                    pass
                 return None, info
             ai_msg = val
         except Exception as e:
@@ -344,6 +548,20 @@ def call_openrouter_with_image_parallel(
                 time.sleep(backoff + (0.2 * backoff * (0.5 - os.urandom(1)[0] / 255.0)))
                 continue
             info = {"variant": None, "error": f"llm_exception: {e.__class__.__name__}: {e}"}
+            try:
+                if events is not None:
+                    base = event_meta or {}
+                    events.emit({
+                        **{k: v for k, v in base.items() if v is not None},
+                        "type": "error",
+                        "scan_type": scan_type,
+                        "detection_type": detection_type,
+                        "model": getattr(llm, "model", None) or None,
+                        "prompt": prompt,
+                        "error": info["error"],
+                    })
+            except Exception:
+                pass
             return None, info
 
         content_text = ""
@@ -363,7 +581,28 @@ def call_openrouter_with_image_parallel(
             "response_excerpt": None,
             "content_text_excerpt": (content_text or "")[:400],
             "usage": getattr(ai_msg, "usage_metadata", None),
+            "prompt_excerpt": (prompt or "")[:300],
+            "prompt_full": prompt,
+            "scan_type": scan_type,
+            "detection_type": detection_type,
+            "content_text": content_text,
         }
+        try:
+            if events is not None:
+                base = event_meta or {}
+                events.emit({
+                    **{k: v for k, v in base.items() if v is not None},
+                    "type": "done",
+                    "scan_type": scan_type,
+                    "detection_type": detection_type,
+                    "model": getattr(llm, "model", None) or None,
+                    "prompt": prompt,
+                    "response_text": content_text,
+                    "status": info.get("status"),
+                    "result": result,
+                })
+        except Exception:
+            pass
         return result, info
 
 
@@ -387,6 +626,13 @@ def main() -> None:
     ap.add_argument("--coarse_log", type=str, default=None, help="Optional JSONL to log coarse-stage results.")
     ap.add_argument("--use_enhanced_prompts", action="store_true", help="Use enhanced prompts with negative examples and confidence calibration.")
     ap.add_argument("--hard_negatives_file", type=str, default=None, help="JSONL file with false positive examples to include as hard negatives in prompts.")
+    ap.add_argument("--events_log", type=str, default=None, help="Optional JSONL to log per-request events for UI visibility.")
+    # DB options
+    ap.add_argument("--emit_boxes_to_db", action="store_true", help="If set and detection_type=construction, write boxes as detections into PostGIS.")
+    ap.add_argument("--db_dsn", type=str, default=None, help="Optional DSN override for Postgres; otherwise built from env.")
+    ap.add_argument("--run_id", type=str, default=None, help="Optional aoi_runs.id to tag detections.")
+    # Construction boxes control
+    ap.add_argument("--construction_boxes", action="store_true", help="Use boxes prompt for construction and emit per-box detections (default: off)")
 
     args = ap.parse_args()
 
@@ -407,6 +653,7 @@ def main() -> None:
         level=logging.DEBUG if args.debug else logging.INFO,
         format="%(asctime)s %(levelname)s %(message)s",
     )
+    silence_external_loggers()
     
     print(f"Detection type: {config.name}", file=sys.stderr)
     print(f"Output file: {args.out}", file=sys.stderr)
@@ -425,6 +672,8 @@ def main() -> None:
     os.makedirs(os.path.dirname(os.path.abspath(args.out)) or ".", exist_ok=True)
     if args.log_all:
         os.makedirs(os.path.dirname(os.path.abspath(args.log_all)) or ".", exist_ok=True)
+    # Prepare events logger (optional)
+    events = EventLogger(args.events_log)
 
     processed_paths: set = set()
     if args.resume:
@@ -449,6 +698,25 @@ def main() -> None:
         except Exception as e:
             print(f"Warning: Could not load hard negatives file: {e}", file=sys.stderr)
     
+    # Optional DB client
+    db: Optional[DbClient] = None
+    if args.construction_boxes and args.emit_boxes_to_db and detection_type == 'construction':
+        if DbClient is None:
+            print("DB: disabled (db module not available)", file=sys.stderr)
+        else:
+            try:
+                db = DbClient(args.db_dsn)
+                print(f"DB: enabled (run_id={args.run_id})", file=sys.stderr)
+            except Exception as e:
+                print(f"DB: connection failed: {e}", file=sys.stderr)
+                db = None
+    else:
+        if detection_type == 'construction':
+            if not args.construction_boxes:
+                print("Boxes: disabled for construction (using boolean prompts)", file=sys.stderr)
+            if not args.emit_boxes_to_db:
+                print("DB: disabled (emit_boxes_to_db not set)", file=sys.stderr)
+
     # If parallel requested, run multi-threaded pipeline and return
     if args.concurrency and args.concurrency > 1:
         limiter = RateLimiter(args.rpm)
@@ -471,17 +739,128 @@ def main() -> None:
 
         q: "queue.Queue[Optional[Dict[str, Any]]]" = queue.Queue(maxsize=max(2, args.concurrency * 2))
 
+        def _insert_construction_boxes(record_all: Dict[str, Any], result_obj: Any, scan_variant: str):
+            if not db:
+                return 0
+            try:
+                z = record_all.get("z"); x = record_all.get("x"); y = record_all.get("y")
+                if not isinstance(z, int) or not isinstance(x, int) or not isinstance(y, int):
+                    return 0
+                # Accept both list and object-with-detections
+                if isinstance(result_obj, list):
+                    det_list = result_obj
+                elif isinstance(result_obj, dict):
+                    det_list = result_obj.get("detections") or result_obj.get("boxes") or []
+                else:
+                    return 0
+                # If context, boxes are in stitched coords; offset central tile
+                r = int(args.context_radius or 0)
+                offset = r * 256 if (scan_variant == 'context' and r > 0) else 0
+                wrote = 0
+                # Upsert tile row
+                try:
+                    ring = bbox_px_to_merc_polygon(z, x, y, (0, 0, 256, 256))
+                    tile_wkt = ring_to_wkt(ring)
+                except Exception:
+                    tile_wkt = None
+                tile_id = db.upsert_imagery_tile(
+                    z=z, x=x, y=y, path=record_all.get("path"),
+                    center_lon=None, center_lat=None, bbox_wkt_3857=tile_wkt,
+                )
+                for d in det_list:
+                    box = d.get("box_2d") or d.get("box")
+                    if not (isinstance(box, list) and len(box) == 4):
+                        continue
+                    try:
+                        x0, y0, x1, y1 = [float(v) for v in box]
+                    except Exception:
+                        continue
+                    # Adjust for stitched offset if needed
+                    x0a = max(0.0, min(256.0, x0 - offset))
+                    y0a = max(0.0, min(256.0, y0 - offset))
+                    x1a = max(0.0, min(256.0, x1 - offset))
+                    y1a = max(0.0, min(256.0, y1 - offset))
+                    # Filter tiny or inverted boxes
+                    if x1a - x0a < 2 or y1a - y0a < 2:
+                        continue
+                    try:
+                        conf = float(d.get("confidence"))
+                    except Exception:
+                        conf = None
+                    if conf is not None and conf < float(args.min_confidence or 0.0):
+                        continue
+                    label = d.get("label")
+                    # edge-touch heuristic
+                    eps = 1.0
+                    edge_touch = (x0a <= eps) or (y0a <= eps) or (x1a >= 256 - eps) or (y1a >= 256 - eps)
+                    ring = bbox_px_to_merc_polygon(z, x, y, (x0a, y0a, x1a, y1a))
+                    wkt = ring_to_wkt(ring)
+                    clon, clat = bbox_center_lonlat(z, x, y, (x0a, y0a, x1a, y1a))
+                    det_id = db.insert_detection(
+                        run_id=args.run_id,
+                        tile_id=tile_id,
+                        model=args.model,
+                        model_ver=None,
+                        confidence=conf,
+                        label=label,
+                        bbox_px=[int(x0a), int(y0a), int(x1a), int(y1a)],
+                        bbox_wkt_3857=wkt,
+                        centroid_lon=clon,
+                        centroid_lat=clat,
+                        edge_touch=edge_touch,
+                        raw=d,
+                    )
+                    # Promote to site if high-confidence
+                    try:
+                        if conf is not None and conf >= max(0.8, float(args.min_confidence or 0.0)):
+                            db.promote_detection_to_site(detection_id=det_id, bbox_wkt_3857=wkt, conf=conf)
+                    except Exception:
+                        pass
+                    wrote += 1
+                return wrote
+            except Exception as e:
+                print(f"DB write error: {e}", file=sys.stderr)
+                return 0
+
         def process_and_write_record(record_all: Dict[str, Any], result_obj: Optional[Dict[str, Any]]):
             is_positive = False
             confidence_val: float = 0.0
             if isinstance(result_obj, dict):
-                detection_key = get_detection_response_key(detection_type)
-                detected_object = result_obj.get(detection_key)
-                try:
-                    confidence_val = float(result_obj.get("confidence"))
-                except (TypeError, ValueError):
-                    confidence_val = 0.0
-                is_positive = bool(detected_object) and (confidence_val >= args.min_confidence)
+                # Handle construction boxes schema
+                if detection_type == 'construction' and args.construction_boxes:
+                    dets = []
+                    if isinstance(result_obj.get('detections'), list):
+                        dets = result_obj.get('detections')
+                    elif isinstance(result_obj.get('boxes'), list):
+                        dets = result_obj.get('boxes')
+                    max_conf = 0.0
+                    for d in dets:
+                        try:
+                            c = float(d.get('confidence'))
+                        except Exception:
+                            continue
+                        if c > max_conf:
+                            max_conf = c
+                    confidence_val = max_conf
+                    is_positive = (confidence_val >= float(args.min_confidence or 0.0)) and (len(dets) > 0)
+                else:
+                    detection_key = get_detection_response_key(detection_type)
+                    detected_object = result_obj.get(detection_key)
+                    try:
+                        confidence_val = float(result_obj.get("confidence"))
+                    except (TypeError, ValueError):
+                        confidence_val = 0.0
+                    is_positive = bool(detected_object) and (confidence_val >= args.min_confidence)
+            _maybe_trace(
+                f"TRACE MT tile {record_all.get('z')}/{record_all.get('x')}/{record_all.get('y')} "
+                f"variant={record_all.get('variant') or 'base'} det_key={get_detection_response_key(detection_type)} "
+                f"conf={confidence_val:.2f} positive={is_positive}"
+            )
+            if detection_type == 'construction' and args.construction_boxes and db is not None and result_obj is not None:
+                wrote = _insert_construction_boxes(record_all, result_obj, record_all.get("variant") or 'base')
+                if wrote:
+                    z = record_all.get("z"); x = record_all.get("x"); y = record_all.get("y")
+                    print(f"DB: wrote {wrote} boxes for tile {z}/{x}/{y}", file=sys.stderr)
             if log_all_fp is not None:
                 to_write = record_all.copy()
                 to_write["positive"] = is_positive
@@ -565,6 +944,14 @@ def main() -> None:
                             scan_type=scan_type,
                             context_radius=args.context_radius or 0,
                             detection_type=detection_type,
+                            use_boxes=(args.construction_boxes if detection_type == 'construction' else False),
+                            events=events,
+                            event_meta={
+                                "path": rel_path,
+                                "z": task.get("z"),
+                                "x": task.get("x"),
+                                "y": task.get("y"),
+                            },
                         )
                         record_all = {
                             "path": rel_path,
@@ -577,6 +964,8 @@ def main() -> None:
                             "variant": info.get("variant"),
                             "response_excerpt": info.get("response_excerpt"),
                             "content_text_excerpt": info.get("content_text_excerpt"),
+                            "prompt_excerpt": info.get("prompt_excerpt"),
+                            "response_text": info.get("content_text"),
                             "error": info.get("error"),
                         }
                         process_and_write_record(record_all, result_obj)
@@ -620,6 +1009,11 @@ def main() -> None:
                             rate_limiter=limiter,
                             scan_type='coarse',
                             detection_type=detection_type,
+                            use_boxes=False,
+                            events=events,
+                            event_meta={
+                                "z": z, "x": x, "y": y, "coarse_factor": f,
+                            },
                         )
                         coarse_conf = 0.0
                         coarse_pos = False
@@ -657,6 +1051,18 @@ def main() -> None:
                                         "abs_path": child_abs,
                                         "z": z, "x": cx, "y": cy,
                                     })
+                                    try:
+                                        events.emit({
+                                            "type": "queued",
+                                            "scan_type": "context" if (args.context_radius or 0) > 0 else "base",
+                                            "detection_type": detection_type,
+                                            "path": child_rel,
+                                            "z": z, "x": cx, "y": cy,
+                                        })
+                                    except Exception:
+                                        pass
+                        else:
+                            _maybe_trace(f"Coarse negative at {z}/{x}/{y} f={f} conf={coarse_conf:.2f}")
                 finally:
                     q.task_done()
 
@@ -679,6 +1085,15 @@ def main() -> None:
                 if (x % f != 0) or (y % f != 0):
                     continue
                 q.put({"type": "coarse", "z": z, "x": x, "y": y, "factor": f})
+                try:
+                    events.emit({
+                        "type": "queued",
+                        "scan_type": "coarse",
+                        "detection_type": detection_type,
+                        "z": z, "x": x, "y": y, "coarse_factor": f,
+                    })
+                except Exception:
+                    pass
         else:
             for image_path in iter_images(tiles_dir):
                 if stop_event.is_set():
@@ -693,6 +1108,16 @@ def main() -> None:
                     "abs_path": image_path,
                     "z": z, "x": x, "y": y,
                 })
+                try:
+                    events.emit({
+                        "type": "queued",
+                        "scan_type": "context" if (args.context_radius or 0) > 0 else "base",
+                        "detection_type": detection_type,
+                        "path": rel_path,
+                        "z": z, "x": x, "y": y,
+                    })
+                except Exception:
+                    pass
 
         # finalize
         q.join()
@@ -705,6 +1130,10 @@ def main() -> None:
             log_all_fp.close()
         if coarse_fp is not None:
             coarse_fp.close()
+        try:
+            events.close()
+        except Exception:
+            pass
         return
 
     sent = 0
@@ -763,7 +1192,17 @@ def main() -> None:
                     canvas_to_send = canvas
 
                 coarse_data_url = encode_pil_image_as_data_url(canvas_to_send, fmt="JPEG", quality=85)
-                
+                # queued
+                try:
+                    events.emit({
+                        "type": "queued",
+                        "scan_type": "coarse",
+                        "detection_type": detection_type,
+                        "z": z, "x": x, "y": y, "coarse_factor": f,
+                    })
+                except Exception:
+                    pass
+
                 result, last_call_time, info = call_openrouter_with_image(
                     llm=llm,
                     image_data_url=coarse_data_url,
@@ -772,6 +1211,9 @@ def main() -> None:
                     last_call_time=last_call_time,
                     scan_type='coarse',
                     detection_type=detection_type,
+                    use_boxes=False,
+                    events=events,
+                    event_meta={"z": z, "x": x, "y": y, "coarse_factor": f},
                 )
                 sent += 1
 
@@ -802,11 +1244,14 @@ def main() -> None:
                         "model": args.model,
                         "http_status": info.get("status"),
                         "error": info.get("error"),
+                        "prompt_excerpt": info.get("prompt_excerpt"),
+                        "response_excerpt": info.get("content_text_excerpt"),
                     }) + "\n")
                     coarse_fp.flush()
 
                 # Refine on positive: scan children tiles normally (with optional context)
                 if coarse_pos:
+                    print(f"Coarse positive at {z}/{x}/{y} f={f} conf={coarse_conf:.2f} -> refine", file=sys.stderr)
                     # Ensure files opened
                     if log_all_fp is None and args.log_all:
                         log_all_fp = open(args.log_all, "a", encoding="utf-8")
@@ -862,6 +1307,18 @@ def main() -> None:
                                     print(f"Skip unreadable image {child_rel}: {e}", file=sys.stderr)
                                     continue
 
+                            # queued child
+                            try:
+                                events.emit({
+                                    "type": "queued",
+                                    "scan_type": scan_type,
+                                    "detection_type": detection_type,
+                                    "path": os.path.join(str(z), str(xc), f"{yc}.jpg"),
+                                    "z": z, "x": xc, "y": yc,
+                                })
+                            except Exception:
+                                pass
+
                             result_c, last_call_time, info_c = call_openrouter_with_image(
                                 llm=llm,
                                 image_data_url=stitched_data_url,
@@ -871,6 +1328,8 @@ def main() -> None:
                                 scan_type=scan_type,
                                 context_radius=args.context_radius or 0,
                                 detection_type=detection_type,
+                                events=events,
+                                event_meta={"path": os.path.join(str(z), str(xc), f"{yc}.jpg"), "z": z, "x": xc, "y": yc},
                             )
                             sent += 1
 
@@ -884,7 +1343,7 @@ def main() -> None:
                                 "model": args.model,
                                 "result_raw": result_c,
                                 "http_status": info_c.get("status"),
-                                "variant": info_c.get("variant"),
+                                "variant": info_c.get("variant") or scan_type,
                                 "response_excerpt": info_c.get("response_excerpt"),
                                 "content_text_excerpt": info_c.get("content_text_excerpt"),
                                 "error": info_c.get("error"),
@@ -893,15 +1352,36 @@ def main() -> None:
                             is_positive = False
                             confidence_val: float = 0.0
                             if isinstance(result_c, dict):
-                                detection_key = get_detection_response_key(detection_type)
-                                detected_object = result_c.get(detection_key)
-                                confidence = result_c.get("confidence")
-                                try:
-                                    confidence_val = float(confidence)
-                                except (TypeError, ValueError):
-                                    confidence_val = 0.0
-                                is_positive = bool(detected_object) and (confidence_val >= args.min_confidence)
+                                if detection_type == 'construction' and args.construction_boxes:
+                                    dets = []
+                                    if isinstance(result_c.get('detections'), list):
+                                        dets = result_c.get('detections')
+                                    elif isinstance(result_c.get('boxes'), list):
+                                        dets = result_c.get('boxes')
+                                    max_conf = 0.0
+                                    for d in dets:
+                                        try:
+                                            c = float(d.get('confidence'))
+                                        except Exception:
+                                            continue
+                                        if c > max_conf:
+                                            max_conf = c
+                                    confidence_val = max_conf
+                                    is_positive = (confidence_val >= float(args.min_confidence or 0.0)) and (len(dets) > 0)
+                                else:
+                                    detection_key = get_detection_response_key(detection_type)
+                                    detected_object = result_c.get(detection_key)
+                                    confidence = result_c.get("confidence")
+                                    try:
+                                        confidence_val = float(confidence)
+                                    except (TypeError, ValueError):
+                                        confidence_val = 0.0
+                                    is_positive = bool(detected_object) and (confidence_val >= args.min_confidence)
 
+                            if detection_type == 'construction' and args.construction_boxes and db is not None and result_c is not None:
+                                wrote_c = _insert_construction_boxes(record_all, result_c, record_all.get("variant") or 'base')
+                                if wrote_c:
+                                    print(f"DB: wrote {wrote_c} boxes for tile {record_all.get('z')}/{record_all.get('x')}/{record_all.get('y')}", file=sys.stderr)
                             if log_all_fp is not None:
                                 to_write = record_all.copy()
                                 to_write["positive"] = is_positive
@@ -973,6 +1453,18 @@ def main() -> None:
                     print(f"Skip unreadable image {rel_path}: {e}", file=sys.stderr)
                     continue
 
+            # queued normal tile
+            try:
+                events.emit({
+                    "type": "queued",
+                    "scan_type": scan_type,
+                    "detection_type": detection_type,
+                    "path": rel_path,
+                    "z": z, "x": x, "y": y,
+                })
+            except Exception:
+                pass
+
             result, last_call_time, info = call_openrouter_with_image(
                 llm=llm,
                 image_data_url=stitched_data_url,
@@ -982,6 +1474,9 @@ def main() -> None:
                 scan_type=scan_type,
                 context_radius=args.context_radius or 0,
                 detection_type=detection_type,
+                use_boxes=(args.construction_boxes if detection_type == 'construction' else False),
+                events=events,
+                event_meta={"path": rel_path, "z": z, "x": x, "y": y},
             )
             sent += 1
 
@@ -1000,9 +1495,11 @@ def main() -> None:
                 "model": args.model,
                 "result_raw": result,
                 "http_status": info.get("status"),
-                "variant": info.get("variant"),
+                "variant": info.get("variant") or scan_type,
                 "response_excerpt": info.get("response_excerpt"),
                 "content_text_excerpt": info.get("content_text_excerpt"),
+                "prompt_excerpt": info.get("prompt_excerpt"),
+                "response_text": info.get("content_text"),
                 "error": info.get("error"),
             }
 
@@ -1010,15 +1507,41 @@ def main() -> None:
             confidence_val: float = 0.0
 
             if isinstance(result, dict):
-                detection_key = get_detection_response_key(detection_type)
-                detected_object = result.get(detection_key)
-                confidence = result.get("confidence")
-                try:
-                    confidence_val = float(confidence)
-                except (TypeError, ValueError):
-                    confidence_val = 0.0
-                is_positive = bool(detected_object) and (confidence_val >= args.min_confidence)
+                if detection_type == 'construction' and args.construction_boxes:
+                    dets = []
+                    if isinstance(result.get('detections'), list):
+                        dets = result.get('detections')
+                    elif isinstance(result.get('boxes'), list):
+                        dets = result.get('boxes')
+                    max_conf = 0.0
+                    for d in dets:
+                        try:
+                            c = float(d.get('confidence'))
+                        except Exception:
+                            continue
+                        if c > max_conf:
+                            max_conf = c
+                    confidence_val = max_conf
+                    is_positive = (confidence_val >= float(args.min_confidence or 0.0)) and (len(dets) > 0)
+                else:
+                    detection_key = get_detection_response_key(detection_type)
+                    detected_object = result.get(detection_key)
+                    confidence = result.get("confidence")
+                    try:
+                        confidence_val = float(confidence)
+                    except (TypeError, ValueError):
+                        confidence_val = 0.0
+                    is_positive = bool(detected_object) and (confidence_val >= args.min_confidence)
 
+            # For construction + boxes, insert per-box detections into DB
+            if detection_type == 'construction' and args.construction_boxes and db is not None and result is not None:
+                wrote = _insert_construction_boxes(record_all, result, scan_type)
+                if wrote:
+                    print(f"DB: wrote {wrote} boxes for tile {record_all.get('z')}/{record_all.get('x')}/{record_all.get('y')}", file=sys.stderr)
+            _maybe_trace(
+                f"TRACE tile {z}/{x}/{y} variant={scan_type} det_key={get_detection_response_key(detection_type)} "
+                f"conf={confidence_val:.2f} positive={is_positive}"
+            )
             # Write all-results line if requested
             if log_all_fp is not None:
                 to_write = record_all.copy()
@@ -1047,8 +1570,11 @@ def main() -> None:
             log_all_fp.close()
         if coarse_fp is not None:
             coarse_fp.close()
+        try:
+            events.close()
+        except Exception:
+            pass
 
 
 if __name__ == "__main__":
     main()
-

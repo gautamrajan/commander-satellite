@@ -1,4 +1,4 @@
-### Integrated Area-Based Scanning & Review: Overhaul Plan
+### Integrated Area-Based Scanning & Review: Overhaul Plan (OLD)
 
 #### Objective
 Unify imagery fetching, scanning, and human review into a single, area-driven workflow: select an area on a map, fetch imagery, scan it, and review detections for that specific area. Add a streamlined dashboard with clear job orchestration, status, and fast approvals.

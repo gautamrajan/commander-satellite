@@ -84,6 +84,7 @@ Area-scoped endpoints (preferred):
 - Scan (AOI)
   - `POST /areas/{area_id}/scan/start` – runs `scan_dumpsters.py` with `--resume`, `--log_all` into AOI paths
   - `GET  /areas/{area_id}/scan/status` – `{ running, pid, counts:{ all_results, out, coarse }, progress:{ processed, total, percent }, stdout, stderr }`
+  - DB-backed (optional): `GET /api/detections`, `GET /api/sites` for querying detections/sites by bbox/date/zcta
   - Progress uses `processed = lines(all_results)` over `total = tiles count`.
 
 - Mosaic/Images (AOI)
@@ -153,6 +154,7 @@ Gotchas:
 python -m venv myenv && source myenv/bin/activate
 pip install -r requirements.txt  # if present; otherwise install imports seen in scripts
 pip install rasterio             # required for GeoTIFF/PNG mosaic outputs
+pip install 'psycopg[binary]'    # Postgres driver (optional DB features)
 export OPENROUTER_API_KEY=...    # required for scanning
 
 # Start dashboard
@@ -197,6 +199,20 @@ curl -X POST localhost:5000/geocode -H 'Content-Type: application/json' \
 - Missing images in mosaic → verify `runs/<AREA_ID>/tiles/z/x/y.jpg` exists; check zoom directory.
 - High false positives → lower `--min_confidence` + gather more labeled data; use Review to build dataset.
 
+Logging & tracing (during debugging):
+- Env toggles (set in `.env`):
+  - `REVIEW_SILENCE_POLL_LOGS=1` – hide frequent `/scan/status` and `/fetch/status` request logs
+  - `SCANNER_SILENCE_HTTP=1` – hide httpx/langchain INFO logs (default)
+  - `SCANNER_DEBUG=1` – one-line “LLM call…” with prompt excerpt to scan stderr
+  - `SCANNER_TRACE=1` – per-tile outcome lines (z/x/y, variant, conf, positive)
+- Log locations (AOI):
+  - `runs/<AREA_ID>/logs/scan.err.log` – launch banner (params, DB status, cmd) + optional DEBUG/TRACE
+  - `runs/<AREA_ID>/coarse.jsonl` – per-coarse call with `prompt_excerpt`, `response_excerpt`, `confidence`, `positive`
+  - `runs/<AREA_ID>/all_results.jsonl` – per-tile record including `result_raw`, full `response_text`, and `prompt_excerpt`
+
+Sanity scan tips:
+- If coarse returns all negatives (no refinement), temporarily set `Coarse factor = 0` and a small `Limit` (e.g., 50) to force per-tile path.
+
 ---
 
 ### 9) Suggested Next Work
@@ -223,3 +239,19 @@ curl -X POST localhost:5000/geocode -H 'Content-Type: application/json' \
 - Don’t block the Flask event loop with long jobs—use subprocess (already in place).
 - When adding fields to JSONL, do so backward-compatibly; UI tolerates missing fields.
 - For sizeable edits, update this primer with any new contracts or flows.
+
+---
+
+### 11) Construction Sites + DB (optional)
+
+- DB setup: install `psycopg[binary]`, run `python db/init_db.py`, ensure `.env` has `DB_*` vars. Use `python db/health_check.py` to verify.
+- AOI scan: creates an `aoi_runs` row when DB is available. For construction, per-box detections can be inserted into DB if both flags are set:
+  - `--construction_boxes` (enable boxes prompt for construction)
+  - `--emit_boxes_to_db` (write boxes into `detections` and promote to `sites`)
+- Query via: `GET /api/detections` and `GET /api/sites`.
+
+### 12) Scan UI Defaults (Sept 2025)
+
+- Area selector: no Global option; defaults to most recent area and binds tiles dir to `runs/<AREA_ID>/tiles` immediately.
+- Defaults: Detection=Construction, Model=`google/gemini-2.5-flash`, RPM=1000, Concurrency=200.
+- Coarse prompt (construction) uses boolean+confidence; per-tile logs include `response_text` and `prompt_excerpt` for audit.

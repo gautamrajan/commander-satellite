@@ -319,6 +319,25 @@ button {
 .scan-logs { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
 .scan-logs pre { max-height: 240px; overflow: auto; padding: 8px; background: #f7f7f7; border-radius: 6px; text-align: left; }
 
+/* LLM Events panel */
+.events-overlay { position: fixed; inset: 0; background: rgba(0,0,0,0.75); z-index: 10000; display: none; }
+.events-overlay.active { display: block; }
+.events-inner { position: absolute; inset: 4% 4%; background: #fff; border-radius: 8px; display: flex; flex-direction: column; }
+.events-toolbar { display: flex; justify-content: space-between; align-items: center; padding: 8px 12px; border-bottom: 1px solid #eee; background: #fafafa; }
+.events-toolbar .left { display: flex; align-items: center; gap: 8px; }
+.events-toolbar .metrics { display: flex; align-items: center; gap: 10px; color: #444; font-size: 12px; }
+.events-body { display: grid; grid-template-columns: 1fr; padding: 8px 12px; gap: 8px; overflow: hidden; height: 100%; }
+.events-list { overflow: auto; border: 1px solid #eee; border-radius: 6px; }
+.event-row { display: grid; grid-template-columns: 100px 80px 1fr 120px; gap: 8px; align-items: center; padding: 8px 10px; border-bottom: 1px solid #f0f0f0; cursor: pointer; font-size: 13px; }
+.event-row:hover { background: #fafafa; }
+.event-row .etype { font-weight: 600; }
+.event-row .etype.sent { color: #795548; }
+.event-row .etype.queued { color: #555; }
+.event-row .etype.done { color: #0f5132; }
+.event-row .etype.error { color: #842029; }
+.event-detail { padding: 10px 12px; background: #f9f9f9; border-top: 1px dashed #e2e2e2; white-space: pre-wrap; font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace; font-size: 12px; }
+.events-controls { display: flex; align-items: center; gap: 8px; }
+
 /* Annotation modal */
 .annotation-overlay { position: fixed; inset: 0; background: rgba(0,0,0,0.75); z-index: 10000; display: none; }
 .annotation-overlay.active { display: block; }

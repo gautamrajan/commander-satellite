@@ -6,7 +6,9 @@ import threading
 import subprocess
 import shutil
 from datetime import datetime
-from flask import Flask, jsonify, render_template, request, send_from_directory
+from flask import Flask, jsonify, render_template, request, send_from_directory, Response
+from flask import stream_with_context
+import logging
 import math
 from typing import List, Tuple
 
@@ -20,8 +22,37 @@ except Exception:
 
 # Import detection type configuration
 from detection_types import get_available_detection_types, get_detection_type, get_output_filename
+try:
+    from db.writer import DbClient
+except Exception:
+    DbClient = None  # optional DB integration
 
 app = Flask(__name__)
+
+# Reduce noisy request logs for status polling endpoints to keep console readable.
+def _configure_request_logging():
+    try:
+        wl = logging.getLogger('werkzeug')
+        # Filter frequent polling endpoints by default
+        if os.getenv('REVIEW_SILENCE_POLL_LOGS', '1') == '1':
+            class _StatusEndpointFilter(logging.Filter):
+                def filter(self, record):
+                    try:
+                        msg = record.getMessage()
+                        if ('/scan/status' in msg) or ('/fetch/status' in msg) or ('/scan/logs' in msg) or ('/scan/events/stream' in msg):
+                            return 0
+                    except Exception:
+                        pass
+                    return 1
+            wl.addFilter(_StatusEndpointFilter())
+        # Optionally suppress all werkzeug request logs below WARNING
+        if os.getenv('REVIEW_SILENCE_REQUEST_LOGS', '0') == '1':
+            wl.setLevel(logging.WARNING)
+            wl.propagate = False
+    except Exception:
+        pass
+
+_configure_request_logging()
 
 TILES_DIR = os.path.abspath("tiles")
 ALL_RESULTS_FILE = "all_results.jsonl"
@@ -94,9 +125,21 @@ def area_paths(area_id: str) -> dict:
 
 def load_results():
     results = []
-    with open(ALL_RESULTS_FILE, "r") as f:
-        for line in f:
-            results.append(json.loads(line))
+    try:
+        if not os.path.exists(ALL_RESULTS_FILE):
+            return results
+        with open(ALL_RESULTS_FILE, "r", encoding="utf-8", errors="ignore") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    results.append(json.loads(line))
+                except json.JSONDecodeError:
+                    continue
+    except Exception:
+        # Fail closed (no detections) instead of 500ing
+        return []
     return results
 
 
@@ -267,6 +310,7 @@ SCAN_STATE = {
         "coarse": None,
         "stdout": None,
         "stderr": None,
+        "events": None,
     },
 }
 SCAN_LOCK = threading.Lock()
@@ -1004,6 +1048,71 @@ def area_scan_start(area_id: str):
 
     # Use detection-type-specific output file
     out_file = os.path.join(p["base"], get_output_filename(detection_type))
+    events_log = os.path.join(p["logs"], "events.jsonl")
+
+    # Optionally create an aoi_run in DB and capture run_id
+    run_id = None
+    db_status_msg = "DB: disabled (module unavailable)" if DbClient is None else None
+    if DbClient is not None:
+        try:
+            area_obj = _safe_read_json(p["area_json"], None)
+            geo = area_obj.get("geometry") if area_obj else None
+            db = DbClient()
+            if isinstance(geo, list) and geo and isinstance(geo[0], list):
+                run_id = db.create_aoi_run(
+                    mode=("kml" if geo else "point_radius"),
+                    params={
+                        "detection_type": detection_type,
+                        "model": model,
+                        "rpm": rpm,
+                        "context_radius": context_radius,
+                        "coarse_factor": coarse_factor,
+                        "coarse_threshold": coarse_threshold,
+                        "area_id": area_id,
+                    },
+                    polygons_latlon=geo,
+                )
+            else:
+                center = area_obj.get("center") or {}
+                center_lat = float(center.get("lat"))
+                center_lon = float(center.get("lon"))
+                area_sqmi_val = float(area_obj.get("area_sqmi") or 0.25)
+                # Build a square around the center approximating the requested area
+                miles_per_deg_lat = 69.0
+                miles_per_deg_lon = 69.0 * max(0.000001, math.cos(math.radians(center_lat)))
+                side_mi = max(0.0, math.sqrt(max(area_sqmi_val, 0.0)))
+                half_lat = (side_mi / 2.0) / miles_per_deg_lat
+                half_lon = (side_mi / 2.0) / miles_per_deg_lon
+                lat_min = center_lat - half_lat
+                lat_max = center_lat + half_lat
+                lon_min = center_lon - half_lon
+                lon_max = center_lon + half_lon
+                square = [[lat_min, lon_min], [lat_min, lon_max], [lat_max, lon_max], [lat_max, lon_min], [lat_min, lon_min]]
+                run_id = db.create_aoi_run(
+                    mode="point_radius",
+                    params={
+                        "detection_type": detection_type,
+                        "model": model,
+                        "rpm": rpm,
+                        "context_radius": context_radius,
+                        "coarse_factor": coarse_factor,
+                        "coarse_threshold": coarse_threshold,
+                        "area_id": area_id,
+                    },
+                    polygons_latlon=[square],
+                )
+            try:
+                db.close()
+            except Exception:
+                pass
+            db_status_msg = f"DB: enabled (run_id={run_id})"
+        except Exception as e:
+            run_id = None
+            db_status_msg = f"DB: connection failed: {e}"
+            try:
+                print(f"[DB] area_scan_start aoi_run failed: {e}", file=sys.stderr)
+            except Exception:
+                pass
 
     cmd = [
         sys.executable, "scan_objects.py",
@@ -1016,6 +1125,11 @@ def area_scan_start(area_id: str):
         "--min_confidence", str(min_conf),
         "--resume",
     ]
+    # For construction: use boxes; if run_id exists, also emit to DB
+    if detection_type == "construction":
+        cmd += ["--construction_boxes"]
+        if run_id:
+            cmd += ["--emit_boxes_to_db", "--run_id", str(run_id)]
     if concurrency and concurrency > 1:
         cmd += ["--concurrency", str(concurrency)]
     if context_radius and context_radius > 0:
@@ -1027,6 +1141,15 @@ def area_scan_start(area_id: str):
                 "--coarse_log", p["coarse"]]
     if limit is not None:
         cmd += ["--limit", str(limit)]
+    # events log for UI visibility
+    cmd += ["--events_log", events_log]
+
+    # Events log for this area scan
+    try:
+        events_log = os.path.join(p["logs"], "events.jsonl")
+        cmd += ["--events_log", events_log]
+    except Exception:
+        pass
 
     os.makedirs(p["logs"], exist_ok=True)
 
@@ -1036,10 +1159,63 @@ def area_scan_start(area_id: str):
             return jsonify({"status": "error", "message": "scan already running"}), 409
         out_fp = open(p["scan_stdout"], "a", encoding="utf-8")
         err_fp = open(p["scan_stderr"], "a", encoding="utf-8")
+        # Prepend a launch banner to stderr for visibility
+        try:
+            ts = datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")
+            banner = [
+                f"=== Scan Launch {ts} ===",
+                f"area_id: {area_id}",
+                f"tiles_dir: {p['tiles']}",
+                f"detection_type: {detection_type}",
+                f"model: {model}",
+                f"rpm: {rpm}",
+                f"concurrency: {concurrency}",
+                f"min_confidence: {min_conf}",
+                f"context_radius: {context_radius}",
+                f"coarse_factor: {coarse_factor}",
+                f"coarse_downscale: {coarse_downscale}",
+                f"coarse_threshold: {coarse_threshold}",
+                f"run_id: {run_id}",
+                db_status_msg or "DB: n/a",
+                f"cmd: {' '.join(map(str, cmd))}",
+                "===\n",
+            ]
+            err_fp.write("\n".join(banner))
+            err_fp.flush()
+        except Exception:
+            pass
         proc = subprocess.Popen(cmd, stdout=out_fp, stderr=err_fp)
         jobs["scan"] = proc
 
-    return jsonify({"status": "started", "pid": proc.pid, "cmd": cmd})
+    # Mirror into global SCAN_STATE so Scan tab + SSE can display this run
+    with SCAN_LOCK:
+        SCAN_STATE["proc"] = proc
+        SCAN_STATE["started_at"] = time.time()
+        SCAN_STATE["args"] = {
+            "area_id": area_id,
+            "tiles_dir": p["tiles"],
+            "detection_type": detection_type,
+            "model": model,
+            "rpm": rpm,
+            "concurrency": concurrency,
+            "context_radius": context_radius,
+            "coarse_factor": coarse_factor,
+        }
+        SCAN_STATE["files"] = {
+            "all_results": p["all_results"],
+            "out": out_file,
+            "coarse": p["coarse"],
+            "stdout": p["scan_stdout"],
+            "stderr": p["scan_stderr"],
+            "events": events_log,
+        }
+        SCAN_STATE["baseline"] = {
+            "all_results": safe_count_lines(p["all_results"]) if os.path.exists(p["all_results"]) else 0,
+            "out": safe_count_lines(out_file) if os.path.exists(out_file) else 0,
+            "coarse": safe_count_lines(p["coarse"]) if os.path.exists(p["coarse"]) else 0,
+        }
+
+    return jsonify({"status": "started", "pid": proc.pid, "cmd": cmd, "events_log": events_log})
 
 
 @app.route("/areas/<area_id>/scan/status")
@@ -1189,6 +1365,70 @@ def scan_start():
         coarse_log = p["coarse"] if (coarse_factor and coarse_factor > 1) else None
         stdout_log = p["scan_stdout"]
         stderr_log = p["scan_stderr"]
+        # Optional: create aoi_run in DB using area geometry (or synthesize from center+area)
+        run_id = None
+        db_status_msg = "DB: disabled (module unavailable)" if DbClient is None else None
+        if DbClient is not None:
+            try:
+                area_obj = _safe_read_json(p["area_json"], None)
+                geo = area_obj.get("geometry") if area_obj else None
+                db = DbClient()
+                if isinstance(geo, list) and geo and isinstance(geo[0], list):
+                    run_id = db.create_aoi_run(
+                        mode=("kml" if geo else "point_radius"),
+                        params={
+                            "detection_type": detection_type,
+                            "model": model,
+                            "rpm": rpm,
+                            "context_radius": context_radius,
+                            "coarse_factor": coarse_factor,
+                            "coarse_threshold": coarse_threshold,
+                            "area_id": area_id,
+                        },
+                        polygons_latlon=geo,
+                    )
+                else:
+                    center = area_obj.get("center") or {}
+                    center_lat = float(center.get("lat"))
+                    center_lon = float(center.get("lon"))
+                    area_sqmi_val = float(area_obj.get("area_sqmi") or 0.25)
+                    # Build a square around the center approximating the requested area
+                    miles_per_deg_lat = 69.0
+                    miles_per_deg_lon = 69.0 * max(0.000001, math.cos(math.radians(center_lat)))
+                    side_mi = max(0.0, math.sqrt(max(area_sqmi_val, 0.0)))
+                    half_lat = (side_mi / 2.0) / miles_per_deg_lat
+                    half_lon = (side_mi / 2.0) / miles_per_deg_lon
+                    lat_min = center_lat - half_lat
+                    lat_max = center_lat + half_lat
+                    lon_min = center_lon - half_lon
+                    lon_max = center_lon + half_lon
+                    square = [[lat_min, lon_min], [lat_min, lon_max], [lat_max, lon_max], [lat_max, lon_min], [lat_min, lon_min]]
+                    run_id = db.create_aoi_run(
+                        mode="point_radius",
+                        params={
+                            "detection_type": detection_type,
+                            "model": model,
+                            "rpm": rpm,
+                            "context_radius": context_radius,
+                            "coarse_factor": coarse_factor,
+                            "coarse_threshold": coarse_threshold,
+                            "area_id": area_id,
+                        },
+                        polygons_latlon=[square],
+                    )
+                try:
+                    db.close()
+                except Exception:
+                    pass
+            except Exception as e:
+                run_id = None
+                db_status_msg = f"DB: connection failed: {e}"
+                try:
+                    print(f"[DB] aoi_run create failed: {e}", file=sys.stderr)
+                except Exception:
+                    pass
+            else:
+                db_status_msg = f"DB: enabled (run_id={run_id})"
     else:
         # Output files (fixed names in cwd)
         all_results = ALL_RESULTS_FILE
@@ -1210,6 +1450,11 @@ def scan_start():
         "--min_confidence", str(min_conf),
         "--resume",
     ]
+    # For construction: use boxes; if run_id exists, also emit to DB
+    if detection_type == "construction":
+        cmd += ["--construction_boxes"]
+        if area_id and run_id:
+            cmd += ["--emit_boxes_to_db", "--run_id", str(run_id)]
     if concurrency and concurrency > 1:
         cmd += ["--concurrency", str(concurrency)]
     if context_radius and context_radius > 0:
@@ -1223,6 +1468,13 @@ def scan_start():
     if limit is not None:
         cmd += ["--limit", str(limit)]
 
+    # Events log path (area-scoped if area_id provided)
+    if area_id:
+        events_log = os.path.join(area_paths(area_id)["logs"], "events.jsonl")
+    else:
+        events_log = os.path.abspath("scan_events.jsonl")
+    cmd += ["--events_log", events_log]
+
     # Prepare stdout/stderr logs (area-scoped if provided)
 
     with SCAN_LOCK:
@@ -1233,6 +1485,7 @@ def scan_start():
         SCAN_STATE["files"]["coarse"] = coarse_log
         SCAN_STATE["files"]["stdout"] = stdout_log
         SCAN_STATE["files"]["stderr"] = stderr_log
+        SCAN_STATE["files"]["events"] = events_log
         SCAN_STATE["baseline"]["all_results"] = safe_count_lines(all_results)
         SCAN_STATE["baseline"]["out"] = safe_count_lines(out_file)
         SCAN_STATE["baseline"]["coarse"] = safe_count_lines(coarse_log) if coarse_log else 0
@@ -1242,6 +1495,31 @@ def scan_start():
 
         stdout_fp = open(stdout_log, "a", encoding="utf-8")
         stderr_fp = open(stderr_log, "a", encoding="utf-8")
+        # Prepend a launch banner to stderr for visibility
+        try:
+            ts = datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")
+            banner = [
+                f"=== Scan Launch {ts} ===",
+                f"area_id: {area_id}",
+                f"tiles_dir: {tiles_dir}",
+                f"detection_type: {detection_type}",
+                f"model: {model}",
+                f"rpm: {rpm}",
+                f"concurrency: {concurrency}",
+                f"min_confidence: {min_conf}",
+                f"context_radius: {context_radius}",
+                f"coarse_factor: {coarse_factor}",
+                f"coarse_downscale: {coarse_downscale}",
+                f"coarse_threshold: {coarse_threshold}",
+                f"run_id: {run_id}",
+                (db_status_msg if area_id else "DB: n/a (global run)") if 'db_status_msg' in locals() else "DB: n/a",
+                f"cmd: {' '.join(map(str, cmd))}",
+                "===\n",
+            ]
+            stderr_fp.write("\n".join(banner))
+            stderr_fp.flush()
+        except Exception:
+            pass
         proc = subprocess.Popen(cmd, stdout=stdout_fp, stderr=stderr_fp)
         SCAN_STATE["proc"] = proc
 
@@ -1382,6 +1660,267 @@ def scan_logs():
         "stdout": tail_lines(stdout_log, max_lines) if stdout_log else "",
         "stderr": tail_lines(stderr_log, max_lines) if stderr_log else "",
     })
+
+
+@app.route("/db/status")
+def db_status():
+    """Quick DB diagnostics: connection ok, DSN (redacted), basic table presence.
+
+    Returns JSON with fields: connected, dsn, error, tables_present.
+    """
+    out = {"connected": False, "dsn": None, "error": None, "tables_present": {}}
+    if DbClient is None:
+        out["error"] = "db module unavailable"
+        return jsonify(out), 200
+    # Build DSN via config util to show what we're using (redacted password)
+    try:
+        from db.config import build_dsn
+        dsn = build_dsn()
+        # redact password in dsn
+        out["dsn"] = dsn.replace("password=" + (os.getenv("DB_PASS") or ""), "password=***")
+    except Exception as e:
+        out["dsn"] = None
+    try:
+        db = DbClient()
+        out["connected"] = True
+        with db.conn.cursor() as cur:
+            # Simple checks for expected tables
+            for t in ("aoi_runs", "detections", "imagery_tiles", "sites"):
+                try:
+                    cur.execute("SELECT to_regclass(%s);", (t,))
+                    present = bool(cur.fetchone()[0])
+                except Exception:
+                    present = False
+                out["tables_present"][t] = present
+        try:
+            db.close()
+        except Exception:
+            pass
+    except Exception as e:
+        out["error"] = str(e)
+        try:
+            print(f"[DB] status check failed: {e}", file=sys.stderr)
+        except Exception:
+            pass
+    return jsonify(out)
+
+
+# ---- LLM events visibility ----
+def _read_jsonl(path: str) -> list:
+    out = []
+    try:
+        with open(path, "r", encoding="utf-8", errors="ignore") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    out.append(json.loads(line))
+                except json.JSONDecodeError:
+                    continue
+    except Exception:
+        pass
+    return out
+
+
+@app.route("/scan/events/list")
+def scan_events_list():
+    try:
+        offset = int(request.args.get("offset", 0))
+    except Exception:
+        offset = 0
+    try:
+        limit = int(request.args.get("limit", 500))
+        limit = max(1, min(limit, 2000))
+    except Exception:
+        limit = 500
+    with SCAN_LOCK:
+        events_path = (SCAN_STATE.get("files") or {}).get("events")
+    if not events_path or not os.path.exists(events_path):
+        return jsonify({"items": [], "next": offset, "total": 0})
+    items = []
+    total = 0
+    try:
+        with open(events_path, "r", encoding="utf-8", errors="ignore") as f:
+            for i, line in enumerate(f):
+                total = i + 1
+                if i < offset:
+                    continue
+                if len(items) >= limit:
+                    break
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    items.append(json.loads(line))
+                except json.JSONDecodeError:
+                    continue
+    except Exception:
+        pass
+    return jsonify({"items": items, "next": offset + len(items), "total": total})
+
+
+@app.route("/scan/events/tail")
+def scan_events_tail():
+    try:
+        n = int(request.args.get("n", 200))
+        n = max(1, min(n, 1000))
+    except Exception:
+        n = 200
+    with SCAN_LOCK:
+        events_path = (SCAN_STATE.get("files") or {}).get("events")
+    if not events_path or not os.path.exists(events_path):
+        return jsonify({"items": [], "total": 0})
+    lines = []
+    try:
+        with open(events_path, "r", encoding="utf-8", errors="ignore") as f:
+            lines = f.readlines()
+    except Exception:
+        lines = []
+    items = []
+    total = len(lines)
+    for raw in lines[-n:]:
+        try:
+            items.append(json.loads(raw))
+        except Exception:
+            continue
+    return jsonify({"items": items, "total": total})
+
+
+@app.route("/scan/events/clear", methods=["POST"])
+def scan_events_clear():
+    with SCAN_LOCK:
+        events_path = (SCAN_STATE.get("files") or {}).get("events")
+    if not events_path:
+        return jsonify({"status": "ok", "cleared": False})
+    try:
+        os.makedirs(os.path.dirname(os.path.abspath(events_path)) or ".", exist_ok=True)
+        with open(events_path, "w", encoding="utf-8") as f:
+            f.write("")
+        return jsonify({"status": "ok", "cleared": True})
+    except Exception as e:
+        return jsonify({"status": "error", "error": str(e)}), 500
+
+
+@app.route("/scan/events/stream")
+def scan_events_stream():
+    """Server-Sent Events (SSE) stream of LLM request events for the active scan.
+
+    Query params:
+      - tail: int (optional) number of most recent events to preload (default: 200)
+    Respects Last-Event-ID header to avoid re-sending events on reconnect (expects seq values).
+    """
+    try:
+        tail_n = int(request.args.get("tail", 200))
+        tail_n = max(0, min(tail_n, 2000))
+    except Exception:
+        tail_n = 200
+
+    with SCAN_LOCK:
+        events_path = (SCAN_STATE.get("files") or {}).get("events")
+
+    def sse_format(ev: dict) -> str:
+        # Send id for reconnection, and a single-line JSON in data
+        ev_id = ev.get("seq")
+        payload = json.dumps(ev, ensure_ascii=False)
+        parts = []
+        if isinstance(ev_id, int):
+            parts.append(f"id: {ev_id}")
+        parts.append(f"data: {payload}")
+        return "\n".join(parts) + "\n\n"
+
+    @stream_with_context
+    def generate():
+        # If no events path yet, keep heartbeating until available or client disconnects
+        while not events_path or not os.path.exists(events_path):
+            try:
+                yield ": waiting for events...\n\n"
+                time.sleep(1.0)
+            except GeneratorExit:
+                return
+            except Exception:
+                time.sleep(1.0)
+            # Re-check in case scan started after initial check
+            with SCAN_LOCK:
+                _p = (SCAN_STATE.get("files") or {}).get("events")
+            if _p and os.path.exists(_p):
+                break
+
+        with SCAN_LOCK:
+            path = (SCAN_STATE.get("files") or {}).get("events")
+        if not path:
+            # nothing to stream; keep connection alive lightly
+            while True:
+                yield ": no events path\n\n"
+                time.sleep(2.0)
+
+        # Preload tail
+        try:
+            with open(path, "r", encoding="utf-8", errors="ignore") as f:
+                lines = f.readlines()
+        except Exception:
+            lines = []
+
+        last_event_id = request.headers.get("Last-Event-ID")
+        start_idx = 0
+        if last_event_id:
+            try:
+                last_id_int = int(last_event_id)
+                # find first line with seq > last_id_int
+                for i, ln in enumerate(lines):
+                    try:
+                        ev = json.loads(ln)
+                        if int(ev.get("seq") or 0) > last_id_int:
+                            start_idx = i
+                            break
+                    except Exception:
+                        continue
+            except Exception:
+                pass
+        else:
+            # use tail
+            if tail_n > 0 and len(lines) > tail_n:
+                start_idx = len(lines) - tail_n
+
+        for ln in lines[start_idx:]:
+            try:
+                ev = json.loads(ln)
+                yield sse_format(ev)
+            except Exception:
+                continue
+
+        # Follow the file for new lines
+        try:
+            with open(path, "r", encoding="utf-8", errors="ignore") as f:
+                f.seek(0, os.SEEK_END)
+                while True:
+                    where = f.tell()
+                    line = f.readline()
+                    if not line:
+                        time.sleep(0.5)
+                        f.seek(where)
+                        # send heartbeat every few cycles to keep proxies happy
+                        yield ": hb\n\n"
+                        continue
+                    try:
+                        ev = json.loads(line)
+                        yield sse_format(ev)
+                    except Exception:
+                        continue
+        except GeneratorExit:
+            return
+        except Exception:
+            # end stream on unexpected errors
+            return
+
+    headers = {
+        "Content-Type": "text/event-stream",
+        "Cache-Control": "no-cache",
+        "Connection": "keep-alive",
+        # Allow XHR streaming and intermediaries
+        "X-Accel-Buffering": "no",
+    }
+    return Response(generate(), headers=headers)
 
 
 @app.route("/geocode", methods=["POST"])
@@ -1594,6 +2133,146 @@ def toggle_review_status():
         "approved": new_approved,
         "reviewed": True
     })
+
+
+# ---- DB-backed API (detections and sites) ----
+def _db_client_or_error():
+    if DbClient is None:
+        return None, (jsonify({"error": "DB module not available"}), 500)
+    try:
+        return DbClient(), None
+    except Exception as e:
+        return None, (jsonify({"error": f"DB connection failed: {e}"}), 500)
+
+
+@app.route("/api/detections")
+def api_detections():
+    db, err = _db_client_or_error()
+    if err:
+        return err
+    try:
+        bbox = request.args.get("bbox")  # west,south,east,north (lon/lat)
+        run_id = request.args.get("run_id")
+        zcta = request.args.get("zcta")
+        date_from = request.args.get("date_from")  # YYYY-MM-DD
+        date_to = request.args.get("date_to")
+        limit = int(request.args.get("limit") or 500)
+        limit = max(1, min(limit, 5000))
+
+        where = []
+        params = []
+        if run_id:
+            where.append("d.run_id = %s")
+            params.append(run_id)
+        if date_from:
+            where.append("d.created_at >= %s")
+            params.append(date_from)
+        if date_to:
+            where.append("d.created_at <= %s")
+            params.append(date_to)
+        if bbox:
+            try:
+                west, south, east, north = [float(x) for x in bbox.split(',')]
+                where.append("ST_Intersects(d.bbox_3857, ST_Transform(ST_MakeEnvelope(%s,%s,%s,%s,4326),3857))")
+                params.extend([west, south, east, north])
+            except Exception:
+                pass
+        if zcta:
+            # Filter via sites zcta by joining through site_detections
+            where.append("sd.site_id IN (SELECT id FROM sites WHERE zcta = %s)")
+            params.append(zcta)
+
+        where_sql = ("WHERE " + " AND ".join(where)) if where else ""
+        sql = f"""
+            SELECT d.id, d.run_id, d.confidence, d.label, d.edge_touch,
+                   ST_AsGeoJSON(ST_Transform(d.bbox_3857,4326)) AS geom,
+                   ST_Y(d.centroid_4326) AS lat, ST_X(d.centroid_4326) AS lon,
+                   d.created_at, it.z, it.x, it.y
+            FROM detections d
+            LEFT JOIN imagery_tiles it ON it.id = d.tile_id
+            LEFT JOIN site_detections sd ON sd.detection_id = d.id
+            {where_sql}
+            ORDER BY d.created_at DESC
+            LIMIT %s
+        """
+        params.append(limit)
+        with db.conn.cursor() as cur:
+            cur.execute(sql, params)
+            rows = cur.fetchall()
+        out = []
+        for r in rows:
+            out.append({
+                "id": str(r[0]), "run_id": r[1], "confidence": float(r[2]) if r[2] is not None else None,
+                "label": r[3], "edge_touch": bool(r[4]), "geom": json.loads(r[5]) if r[5] else None,
+                "lat": r[6], "lon": r[7], "created_at": r[8].isoformat() if hasattr(r[8], 'isoformat') else r[8],
+                "z": r[9], "x": r[10], "y": r[11],
+            })
+        return jsonify(out)
+    finally:
+        try:
+            db.close()
+        except Exception:
+            pass
+
+
+@app.route("/api/sites")
+def api_sites():
+    db, err = _db_client_or_error()
+    if err:
+        return err
+    try:
+        bbox = request.args.get("bbox")
+        zcta = request.args.get("zcta")
+        date_from = request.args.get("date_from")
+        date_to = request.args.get("date_to")
+        limit = int(request.args.get("limit") or 500)
+        limit = max(1, min(limit, 5000))
+
+        where = []
+        params = []
+        if zcta:
+            where.append("zcta = %s")
+            params.append(zcta)
+        if date_from:
+            where.append("last_seen >= %s")
+            params.append(date_from)
+        if date_to:
+            where.append("first_seen <= %s")
+            params.append(date_to)
+        if bbox:
+            try:
+                west, south, east, north = [float(x) for x in bbox.split(',')]
+                where.append("ST_Intersects(aabb_3857, ST_Transform(ST_MakeEnvelope(%s,%s,%s,%s,4326),3857))")
+                params.extend([west, south, east, north])
+            except Exception:
+                pass
+        where_sql = ("WHERE " + " AND ".join(where)) if where else ""
+        sql = f"""
+            SELECT id, zcta, detections_count, conf, first_seen, last_seen,
+                   ST_AsGeoJSON(ST_Transform(aabb_3857,4326)) AS geom,
+                   ST_Y(centroid_4326) AS lat, ST_X(centroid_4326) AS lon
+            FROM sites
+            {where_sql}
+            ORDER BY last_seen DESC NULLS LAST
+            LIMIT %s
+        """
+        params.append(limit)
+        with db.conn.cursor() as cur:
+            cur.execute(sql, params)
+            rows = cur.fetchall()
+        out = []
+        for r in rows:
+            out.append({
+                "id": str(r[0]), "zcta": r[1], "detections_count": r[2], "conf": float(r[3]) if r[3] is not None else None,
+                "first_seen": r[4].isoformat() if r[4] else None, "last_seen": r[5].isoformat() if r[5] else None,
+                "geom": json.loads(r[6]) if r[6] else None, "lat": r[7], "lon": r[8],
+            })
+        return jsonify(out)
+    finally:
+        try:
+            db.close()
+        except Exception:
+            pass
 
 
 # -------- Annotations (global legacy) --------
